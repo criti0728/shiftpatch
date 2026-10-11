@@ -1,0 +1,16 @@
+.git
+.venv
+.env
+.env.*
+node_modules
+**/node_modules
+**/dist
+**/__pycache__
+**/.pytest_cache
+**/*.egg-info
+**/data
+test-results
+playwright-report
+.DS_Store
+*.log
+**/*.tsbuildinfo
