@@ -8,11 +8,12 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from random import Random
 
-from ..planning.forecast import forecast_sales, service_window
+from ..planning.forecast import forecast_sales, forecast_windows, service_window
+from ..inventory import simulation_pools, take_pool
 from ..timeutils import iso, parse_time
 
 
-ENGINE_VERSION = "1.0.0"
+ENGINE_VERSION = "2.0.0"
 
 
 def _first_slot(start: datetime, seconds: int, intervals: list[tuple[datetime, datetime]]) -> datetime:
@@ -28,15 +29,16 @@ def _first_slot(start: datetime, seconds: int, intervals: list[tuple[datetime, d
 
 def _arrival_scenario(state: dict, seed: int) -> list[dict]:
     start, end = service_window(state)
-    counts, _ = forecast_sales(state)
+    windows, _ = forecast_windows(state)
     rng = Random(seed)
-    duration = (end - start).total_seconds()
     arrivals = []
-    for menu_id in sorted(counts):
-        for index in range(counts[menu_id]):
-            # Stratification avoids random empty intervals but preserves varied order.
-            arrived = start + timedelta(seconds=(index + rng.random()) * duration / counts[menu_id])
-            arrivals.append({"id": f"arrival-{menu_id}-{index}", "menu_id": menu_id, "arrived": arrived})
+    for window_index, window in enumerate(windows):
+        left, right = parse_time(window['start_at']), parse_time(window['end_at'])
+        duration = (right - left).total_seconds()
+        for menu_id, count in sorted(window['counts'].items()):
+            for index in range(count):
+                arrived = left + timedelta(seconds=(index + rng.random()) * duration / count)
+                arrivals.append({'id': f'arrival-{menu_id}-{window_index}-{index}', 'menu_id': menu_id, 'arrived': arrived})
     return sorted(arrivals, key=lambda row: (row["arrived"], row["id"]))
 
 
@@ -52,6 +54,7 @@ def simulate(
     """
     if not isinstance(horizon_minutes, (int, float)) or not 0 < horizon_minutes <= 1440:
         raise ValueError("horizon_minutes must be within (0, 1440]")
+    state, reserved_stock, free_stock = simulation_pools(state)
     now = parse_time(state["business_now"])
     horizon = now + timedelta(minutes=horizon_minutes)
     menus = {menu["id"]: menu for menu in state["menus"]}
@@ -74,8 +77,6 @@ def simulate(
         notes.extend(forecast_notes)
 
     # Reserved stock and free stock are separate pools: existing jobs never pay twice.
-    reserved_stock = {key: max(0, min(entry["on_hand"], entry.get("reserved", 0))) for key, entry in inventory.items()}
-    free_stock = {key: max(0, entry["on_hand"] - entry.get("reserved", 0)) for key, entry in inventory.items()}
     for key, entry in inventory.items():
         if entry.get("reserved", 0) > entry["on_hand"]:
             notes.append(f"{entry['name']}：実在庫が予約量を下回っています。影響する作業の確認が必要です。")
@@ -103,12 +104,8 @@ def simulate(
         finish, start, staff_id = min(options)
         return staff_id, start, finish
 
-    def usable(recipe: dict, pool: dict, finish: datetime) -> bool:
-        return all(
-            key in inventory and quantity <= pool.get(key, 0)
-            and parse_time(inventory[key]["expires_at"]) > finish
-            for key, quantity in recipe.items()
-        )
+    def usable(recipe, pool, finish, allocations=None):
+        return take_pool(pool, recipe, finish, allocations=allocations)
 
     def reserve_slot(job: dict, staff_id: str, start: datetime, finish: datetime):
         station = job["station"]
@@ -151,7 +148,7 @@ def simulate(
             not person.get("absent") and start <= now and finish > now
             and start >= parse_time(person["shift_start"]) and finish <= parse_time(person["shift_end"])
             and not any(start < right and finish > left for left, right in conflicts)
-            and usable(job["recipe"], reserved_stock, finish)
+            and usable(job["recipe"], reserved_stock, finish, job.get("lot_allocations"))
         )
         if not valid:
             job["at_risk"] = True
@@ -161,18 +158,17 @@ def simulate(
             calendars[f"station:{job['station']}"].append((now, max(horizon, finish)))
             continue
         reserve_slot(job, person["id"], start, finish)
-        for key, quantity in job["recipe"].items():
-            reserved_stock[key] -= quantity
+        take_pool(reserved_stock, job["recipe"], job["finish"], allocations=job.get("lot_allocations"), commit=True)
 
     for job in [entry for entry in jobs if entry["status"] != "preparing"]:
+        pool = free_stock if job.get('reservation_pending') else reserved_stock
         found = assignment(job["menu_id"], job["arrived"], job["station"])
-        if found is None or not usable(job["recipe"], reserved_stock, found[2]):
+        if found is None or not usable(job["recipe"], pool, found[2], job.get("lot_allocations")):
             job["at_risk"] = True
             notes.append(f"既存作業 {job['id']}：勤務・作業台、または使用時点の予約済み在庫が不足しています。")
             continue
         reserve_slot(job, *found)
-        for key, quantity in job["recipe"].items():
-            reserved_stock[key] -= quantity
+        take_pool(pool, job["recipe"], job["finish"], allocations=job.get("lot_allocations"), commit=True)
 
     if include_arrivals:
         _, service_end = service_window(state)
@@ -193,8 +189,7 @@ def simulate(
             reserve_slot(job, *found)
             jobs.append(job)
             used[menu_id] = used.get(menu_id, 0) + 1
-            for key, quantity in menu["recipe"].items():
-                free_stock[key] -= quantity
+            take_pool(free_stock, menu["recipe"], found[2], commit=True)
 
     completed = [job for job in jobs if job["finish"] is not None and job["finish"] <= horizon]
     pending = [job for job in jobs if job["finish"] is None or job["finish"] > horizon]
@@ -223,5 +218,6 @@ def simulate(
                     "max_wait_minutes": round(max(waits, default=0), 1),
                     "revenue": revenue, "existing_at_risk": at_risk},
         "feasible": at_risk == 0, "notes": list(dict.fromkeys(notes)),
+        "existing_commitments_at_risk": sorted({job["order_id"] for job in jobs if job["existing"] and job["at_risk"]}),
         "schedule": sorted(schedule, key=lambda row: (row["start_at"], row["task_id"])),
     }

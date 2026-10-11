@@ -6,6 +6,7 @@ from math import ceil
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+from . import inventory as lots
 from .errors import DomainError
 from .timeutils import iso, parse_time
 
@@ -63,7 +64,7 @@ def record_restrictions(state, at=None):
     at = at or now(state)
     if state.get("closed") or not open_time(state) <= at < close_time(state):
         return
-    stock = {entry["id"]: entry for entry in state["inventory"]}
+    stock = lots.migrate(state)
     for menu in state["menus"]:
         staffed = any(
             not person["absent"] and person["skills"].get(menu["id"], 0) > 0
@@ -71,8 +72,7 @@ def record_restrictions(state, at=None):
             for person in state["staff"]
         )
         stocked = all(
-            stock[key]["on_hand"] - stock[key]["reserved"] >= quantity
-            and parse_time(stock[key]["expires_at"]) > at
+            lots.available(stock[key], at) >= quantity
             for key, quantity in menu["recipe"].items()
         )
         if not staffed or not stocked:
@@ -85,25 +85,24 @@ def record_restrictions(state, at=None):
 
 def overview(state, agent_mode="calculation_only"):
     value = deepcopy(state)
+    lots.migrate(value)
     value.pop("idempotency", None)
     value.pop("agent_runs", None)
     if value["mode"].get("review_at") and now(state) >= parse_time(value["mode"]["review_at"]):
         value["mode"]["status"] = "review_required"
-    stock = {i["id"]: i for i in state["inventory"]}
+    stock = {i["id"]: i for i in value["inventory"]}
     for menu in value["menus"]:
         eligible = active_staff(state, menu["id"])
         minimum_duration = min((p["skills"][menu["id"]] for p in eligible), default=0)
         potential_finish = now(state) + timedelta(seconds=minimum_duration)
-        amounts = [max(0, stock[key]["on_hand"]-stock[key]["reserved"]) // qty
-                   if parse_time(stock[key]["expires_at"]) > potential_finish else 0
+        amounts = [lots.available(stock[key], potential_finish) // qty
                    for key, qty in menu["recipe"].items()]
         limit = None if state["mode"]["limits"] is None else max(0, state["mode"]["limits"].get(menu["id"], 0)-state["mode"]["used"].get(menu["id"], 0))
         available = min(amounts, default=0) if eligible and open_time(state) <= now(state) < close_time(state) and not state.get("closed") else 0
         menu["available_units"] = min(available, limit) if limit is not None else available
         menu["limit_remaining"] = limit
     for proposal in value["proposals"]:
-        if proposal["status"] == "ready" and (proposal["revision"] != state["revision"] or
-            (proposal.get("review_at") and now(state) >= parse_time(proposal["review_at"]))):
+        if proposal["status"] == "ready" and not proposal_current(proposal, value):
             proposal["status"] = "stale"
     completed = [o for o in value["orders"] if o["status"] == "completed"]
     value["metrics"] = {"completed_orders": len(completed), "revenue": sum(o["total"] for o in completed),
@@ -141,20 +140,20 @@ def adjust_inventory(state, ingredient_id, on_hand):
     assert_not_preparing(state)
     ingredient = get(state["inventory"], ingredient_id, "材料")
     difference = on_hand - ingredient["on_hand"]
-    ingredient["on_hand"] = on_hand
+    lots.adjust(ingredient, on_hand, state["business_now"])
     record_restrictions(state)
     bump(state)
     event(state, "inventory", f"{ingredient['name']} 実棚 {on_hand}{ingredient['unit']}（差分 {difference:+d}）。")
     return {"ok": True}
 
 
-def receive_delivery(state, delivery_id, quantity):
+def receive_delivery(state, delivery_id, quantity, expires_at=None):
     delivery = get(state["deliveries"], delivery_id, "入荷予定")
     if delivery["received"]:
         raise DomainError("already_received", "この入荷はすでに記録されています。")
     record_restrictions(state)
     ingredient = get(state["inventory"], delivery["ingredient_id"], "材料")
-    ingredient["on_hand"] += quantity
+    lots.receipt(ingredient, quantity, expires_at or delivery.get("expires_at") or ingredient["expires_at"], state["business_now"])
     delivery.update(received=True, actual_quantity=quantity, received_at=state["business_now"])
     bump(state)
     event(state, "delivery", f"{ingredient['name']} {quantity}{ingredient['unit']}を入荷（予定 {delivery['quantity']}）。")
@@ -172,7 +171,7 @@ def create_order(state, items):
     if sum(amounts.values()) > 20:
         raise DomainError("order_too_large", "1回の注文は20点までです。", 422)
     menus = {menu["id"]: menu for menu in state["menus"]}
-    stock = {ingredient["id"]: ingredient for ingredient in state["inventory"]}
+    stock = lots.migrate(state)
     needed = Counter()
     for menu_id, quantity in amounts.items():
         if menu_id not in menus:
@@ -187,7 +186,7 @@ def create_order(state, items):
             needed[ingredient_id] += usage * quantity
     for ingredient_id, amount in needed.items():
         ingredient = stock[ingredient_id]
-        if ingredient["on_hand"]-ingredient["reserved"] < amount or parse_time(ingredient["expires_at"]) <= now(state):
+        if lots.available(ingredient, now(state)) < amount:
             raise DomainError("insufficient_inventory", f"{ingredient['name']}の使用可能在庫が不足しています。")
     identifier = str(uuid4())
     order = {"id": identifier, "number": len(state["orders"])+1, "created_at": state["business_now"], "status": "accepted", "items": [], "tasks": [], "total": 0}
@@ -198,8 +197,8 @@ def create_order(state, items):
         for _ in range(quantity):
             order["tasks"].append({"id": str(uuid4()), "menu_id": menu_id, "status": "accepted", "staff_id": None,
                                    "station": menu["station"], "started_at": None, "duration_seconds": None, "allocations": deepcopy(menu["recipe"])})
-    for ingredient_id, amount in needed.items():
-        stock[ingredient_id]["reserved"] += amount
+    for task in order["tasks"]:
+        task["reservation_pending"] = True
     state["orders"].append(order)
     # Simulate the queue including the provisional order. A failure rolls back the entire transaction.
     from .simulation.engine import simulate
@@ -210,6 +209,9 @@ def create_order(state, items):
         row = schedule.get(task["id"])
         if row is None or parse_time(row["finish_at"]) > close_time(state):
             raise DomainError("capacity_exceeded", "現在の人員・在庫では営業時間内に提供できません。注文内容を減らしてください。")
+        task['lot_allocations'] = {key: lots.reserve(stock[key], amount, parse_time(row['finish_at']))
+                                   for key, amount in task['allocations'].items()}
+        task.pop('reservation_pending', None)
     for menu_id, quantity in amounts.items():
         state["mode"]["used"][menu_id] = state["mode"]["used"].get(menu_id, 0) + quantity
     record_restrictions(state)
@@ -223,7 +225,7 @@ def update_task(state, order_id, task_id, status, staff_id=None):
     task = get(order["tasks"], task_id, "作業")
     if status == task["status"]:
         return {"ok": True}
-    stock = {i["id"]: i for i in state["inventory"]}
+    stock = lots.migrate(state)
     for ingredient_id in task["allocations"]:
         ingredient = stock[ingredient_id]
         if ingredient["on_hand"] < ingredient["reserved"]:
@@ -239,21 +241,14 @@ def update_task(state, order_id, task_id, status, staff_id=None):
         person = min(available, key=lambda p: p["skills"][task["menu_id"]])
         duration = person["skills"][task["menu_id"]]
         finish = now(state) + timedelta(seconds=duration)
-        for ingredient_id in task["allocations"]:
-            if parse_time(stock[ingredient_id]["expires_at"]) <= finish:
-                raise DomainError("expired_inventory", "提供予定時刻まで使える材料がありません。")
+        lots.validate_task(stock, task, finish)
         # Accepted commitments survive closing. New orders have already passed
         # the service-window check; late fulfillment still requires valid shifts.
         task.update(status="preparing", staff_id=person["id"], started_at=state["business_now"], duration_seconds=duration)
     elif status == "completed" and task["status"] == "preparing":
         if now(state) < parse_time(task["started_at"]) + timedelta(seconds=task["duration_seconds"]):
             raise DomainError("task_not_ready", "準備時間がまだ経過していません。デモ時刻を進めてください。")
-        for ingredient_id, quantity in task["allocations"].items():
-            ingredient = stock[ingredient_id]
-            if ingredient["on_hand"] < quantity or ingredient["reserved"] < quantity:
-                raise DomainError("reservation_shortfall", "確保済み材料が不足しています。")
-            ingredient["on_hand"] -= quantity
-            ingredient["reserved"] -= quantity
+        lots.consume(stock, task, now(state))
         task["status"] = "completed"
         task["completed_at"] = state["business_now"]
     else:
@@ -277,15 +272,24 @@ def approve(state, proposal_id, candidate_id, expected_revision):
         raise DomainError("stale_proposal", "条件が変わりました。最新の条件で再計算してください。")
     if proposal.get("review_at") and now(state) >= parse_time(proposal["review_at"]):
         raise DomainError("expired_proposal", "提案の有効時間が過ぎました。再計算してください。")
+    if not proposal_current(proposal, state):
+        raise DomainError('stale_proposal', '勤務または材料の有効期限が変わりました。再分析してください。')
     candidate = get(proposal["candidates"], candidate_id, "候補")
+    valid_until = parse_time(candidate.get('valid_until') or iso(parse_time(proposal['created_at']) + timedelta(minutes=candidate['review_after_minutes'])))
+    if now(state) >= valid_until:
+        raise DomainError('expired_candidate', '候補の評価区間が過ぎました。再分析してください。')
     if not candidate["feasible"]:
         raise DomainError("infeasible_candidate", "この候補は実行できません。条件を確認してください。")
+    from .simulation.engine import simulate
+    current = simulate(state, candidate, include_arrivals=False)
+    if not current['feasible']:
+        raise DomainError('existing_commitments_at_risk', '既存注文の材料・担当条件を確認してから再分析してください。')
     if candidate["action"] == "replace_limits":
         limits = candidate["limits"]
         if set(limits) != {m["id"] for m in state["menus"]} or any(type(x) is not int or x < 0 for x in limits.values()):
             raise DomainError("invalid_candidate", "候補の販売上限が不正です。")
         state["mode"] = {"id": str(uuid4()), "limits": deepcopy(limits), "used": {}, "starts_at": state["business_now"],
-                         "review_at": iso(now(state)+timedelta(minutes=candidate["review_after_minutes"])), "status": "active",
+                         "review_at": iso(valid_until), "status": "active",
                          "proposal_id": proposal_id, "candidate_id": candidate_id}
         state["restricted_today"] = True
     proposal["status"] = "applied"
@@ -304,6 +308,8 @@ def acknowledge(state, proposal_id):
         raise DomainError("stale_proposal", "条件が変わりました。再計算してください。")
     if proposal.get("review_at") and now(state) >= parse_time(proposal["review_at"]):
         raise DomainError("expired_proposal", "提案の有効時間が過ぎました。再計算してください。")
+    if not proposal_current(proposal, state):
+        raise DomainError('stale_proposal', '条件の時間境界を超えました。再計算してください。')
     proposal["status"] = "acknowledged"
     event(state, "acknowledge", "準備案を確認済みとして記録しました。実際の発注は行いません。")
     return {"ok": True}
@@ -328,18 +334,26 @@ def advance(state, minutes):
     for at in transitions:
         if now(state) <= at <= target:
             record_restrictions(state, at)
+    if state.get('clock', {}).get('mode') == 'realtime':
+        raise DomainError('clock_running', '手動時計に戻してから時刻を進めてください。')
     state["business_now"] = iso(target)
     bump(state)
     event(state, "clock", f"営業時刻を{minutes}分進めました。")
     return {"ok": True}
 
 
-def update_history(state, date, counts, restricted):
+def update_history(state, date, counts, restricted, windows=None):
     if set(counts) != {m["id"] for m in state["menus"]}:
         raise DomainError("invalid_counts", "全メニューの販売数を入力してください。", 422)
     entry = next((h for h in state["history"] if h["date"] == date), None)
     if entry is None:
         raise DomainError("not_found", "対象の営業記録がありません。", 404)
+    if windows is not None:
+        if any(set(w['counts']) != set(counts) for w in windows) or any(sum(w['counts'][key] for w in windows) != counts[key] for key in counts):
+            raise DomainError('invalid_windows', '時間帯別販売数は日別販売数と一致させてください。', 422)
+        entry['windows'] = windows
+    elif entry.get('counts') != counts:
+        entry.pop('windows', None)
     entry.update(counts=counts, restricted=restricted)
     bump(state)
     event(state, "history", f"{date} の販売記録を更新しました。")
@@ -376,9 +390,79 @@ def close_day(state):
         close["notes"].append("確認済みの当日準備案がないため、締め時点の過去販売基準との比較です。")
     if pending_orders:
         close["notes"].append("未提供注文が残っているため、完了販売数を通常日の需要低下の根拠には使いません。")
+    from .planning.forecast import service_window
+    left, end = service_window(state)
+    windows = []
+    while left < end:
+        right = min(end, left + timedelta(minutes=30))
+        rows = [o for o in completed if left <= parse_time(o['completed_at']) < right]
+        windows.append({'start_time': left.strftime('%H:%M'), 'counts': {
+            m['id']: sum(i['quantity'] for o in rows for i in o['items'] if i['menu_id'] == m['id'])
+            for m in state['menus']}})
+        left = right
+    from .planning.forecast import forecast_windows
+    close['forecast_windows'] = deepcopy(plan['prep'].get('windows', [])) if plan else forecast_windows(state)[0]
+    close['windows'] = windows
+    close['events'] = deepcopy(state['events'])
+    close['mode'] = deepcopy(state['mode'])
     state["closes"].insert(0, close)
-    state["history"].insert(0, {"date": close["service_date"], "counts": counts, "restricted": restricted})
+    state["history"].insert(0, {"date": close["service_date"], "counts": counts, "restricted": restricted, "windows": windows})
     state["closed"] = True
     bump(state)
     event(state, "close", "本日の締めを確定しました。未提供注文の材料は引き続き確保します。")
     return {"close": deepcopy(close)}
+
+
+def add_lot(state, ingredient_id, quantity, expires_at):
+    assert_not_preparing(state)
+    entry = get(state['inventory'], ingredient_id, '材料')
+    if parse_time(expires_at) <= now(state):
+        raise DomainError('invalid_expiry', '有効期限は営業時刻より後にしてください。', 422)
+    lots.receipt(entry, quantity, expires_at, state['business_now'])
+    record_restrictions(state)
+    bump(state)
+    event(state, 'lot', f"{entry['name']}のロットを追加しました。")
+    return {'ok': True}
+
+
+def dismiss(state, proposal_id):
+    proposal = get(state['proposals'], proposal_id, '提案')
+    if proposal['status'] in {'applied', 'acknowledged'}:
+        raise DomainError('already_used', '使用済み提案は取り消せません。')
+    proposal['status'] = 'dismissed'
+    event(state, 'dismiss', '提案を見送りました。')
+    return {'ok': True}
+
+
+def proposal_current(proposal, state):
+    if proposal['revision'] != state['revision']:
+        return False
+    if proposal.get('review_at') and now(state) >= parse_time(proposal['review_at']):
+        return False
+    created = parse_time(proposal['created_at'])
+    # Real-time pacing does not invalidate every second, but transitions changing
+    # staffing or usable stock invalidate the original snapshot.
+    boundaries = [parse_time(p[k]) for p in state['staff'] for k in ('shift_start', 'shift_end')]
+    boundaries += [parse_time(l['expires_at']) for i in state['inventory'] for l in lots.ensure(i)]
+    return not any(created < boundary <= now(state) for boundary in boundaries)
+
+
+def reallocate_task(state, order_id, task_id):
+    task = get(get(state['orders'], order_id, '注文')['tasks'], task_id, '作業')
+    if task['status'] != 'accepted':
+        raise DomainError('invalid_transition', '未開始の作業だけ材料を再確保できます。')
+    stock = lots.migrate(state)
+    for key, rows in task.get('lot_allocations', {}).items():
+        by_id = {l['id']: l for l in stock[key]['lots']}
+        for row in rows:
+            if row['lot_id'] in by_id:
+                by_id[row['lot_id']]['reserved'] -= row['quantity']
+        lots.sync(stock[key])
+    duration = min((p['skills'][task['menu_id']] for p in active_staff(state, task['menu_id'])), default=0)
+    if not duration:
+        raise DomainError('no_staff', '担当できる勤務中スタッフがいません。')
+    finish = now(state)+timedelta(seconds=duration)
+    task['lot_allocations'] = {key: lots.reserve(stock[key], count, finish) for key, count in task['allocations'].items()}
+    bump(state)
+    event(state, 'reallocate', '店長の確認で未開始作業の材料を再確保しました。')
+    return {'ok': True}

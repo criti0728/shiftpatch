@@ -5,10 +5,12 @@ from datetime import timedelta
 
 from ..simulation.engine import simulate
 from ..timeutils import iso, parse_time
-from .forecast import forecast_sales, service_window
+from .forecast import forecast_sales, forecast_windows, service_window
+from ..inventory import available
 
 
 def calculate_prep(state: dict, service_date: str | None = None) -> dict:
+    state = deepcopy(state)
     current_date = state["store"]["service_date"]
     target = service_date or current_date
     start, end = service_window(state, target)
@@ -65,7 +67,7 @@ def calculate_prep(state: dict, service_date: str | None = None) -> dict:
             needed[ingredient_id] += count * amount
     items = []
     for entry in state["inventory"]:
-        available = max(0, entry["on_hand"] - entry.get("reserved", 0)) if parse_time(entry["expires_at"]) > end else 0
+        usable_stock = available(entry, end)
         incoming = sum(
             delivery["quantity"] for delivery in state.get("deliveries", [])
             if delivery["ingredient_id"] == entry["id"] and delivery.get("confirmed") and not delivery.get("received")
@@ -74,6 +76,6 @@ def calculate_prep(state: dict, service_date: str | None = None) -> dict:
         )
         buffer = max(0, entry.get("buffer", 0))
         items.append({"ingredient_id": entry["id"], "name": entry["name"], "unit": entry["unit"],
-                      "needed": needed[entry["id"]], "available": available, "incoming": incoming,
-                      "buffer": buffer, "to_order": max(0, needed[entry["id"]] + buffer - available - incoming)})
-    return {"service_date": target, "forecast": forecast, "planned": planned, "items": items, "notes": notes}
+                      "needed": needed[entry["id"]], "available": usable_stock, "incoming": incoming,
+                      "buffer": buffer, "to_order": max(0, needed[entry["id"]] + buffer - usable_stock - incoming)})
+    return {"service_date": target, "forecast": forecast, "windows": forecast_windows(state, target)[0], "planned": planned, "items": items, "notes": notes}
