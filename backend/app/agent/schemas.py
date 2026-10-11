@@ -14,6 +14,11 @@ class DateArgs(StrictModel):
     service_date: str | None = None
 
 
+class SalesArgs(DateArgs):
+    start_time: str | None = Field(default=None, pattern=r"^(?:[01][0-9]|2[0-3]):(?:00|30)$")
+    end_time: str | None = Field(default=None, pattern=r"^(?:[01][0-9]|2[0-3]):(?:00|30)$")
+
+
 class StaffArgs(StrictModel):
     staff_ids: list[str] = Field(default_factory=list, max_length=50)
     menu_ids: list[str] = Field(default_factory=list, max_length=50)
@@ -61,13 +66,25 @@ class CandidateNote(StrictModel):
     tradeoff: str = Field(min_length=1, max_length=500)
 
 
+class Question(StrictModel):
+    id: str = Field(min_length=1, max_length=80, pattern=r"^[a-zA-Z0-9_-]+$")
+    text: str = Field(min_length=1, max_length=500)
+    field: Literal["staff", "next_day_staff", "inventory", "history", "close", "objective", "allow_menu_pause", "review_after_minutes"]
+    options: list[str] = Field(default_factory=list, max_length=6)
+
+
+class Constraints(StrictModel):
+    allowed_review_minutes: list[Literal[15, 30]] = Field(default_factory=lambda: [15, 30], min_length=1, max_length=2)
+    allow_menu_pause: bool = True
+
+
 class FinalAnswer(StrictModel):
     outcome: Literal["ready", "needs_input", "no_feasible_plan"]
     summary: str = Field(min_length=1, max_length=1000)
     recommended_candidate_id: str | None = None
     candidate_notes: list[CandidateNote] = Field(default_factory=list, max_length=5)
     evidence_refs: list[str] = Field(default_factory=list, max_length=12)
-    questions: list[str] = Field(default_factory=list, max_length=5)
+    questions: list[Question] = Field(default_factory=list, max_length=5)
     plan_result_id: str | None = None
     sales_basis_result_id: str | None = None
     comparison_result_id: str | None = None
@@ -80,7 +97,7 @@ TOOL_SCHEMAS = {
     "read_queue": (QueueArgs, "Read existing orders and staff/station occupancy; existing commitments must be preserved."),
     "read_current_mode": (EmptyArgs, "Read current limits, amounts already used and review time."),
     "read_menu_recipes": (EmptyArgs, "Read menu categories, prices, stations and ingredient recipes."),
-    "estimate_sales": (DateArgs, "Calculate demand basis; sales restricted by service settings are not normal demand."),
+    "estimate_sales": (SalesArgs, "Calculate daily and 30-minute demand basis. Optional start_time/end_time select service-window buckets (HH:00 or HH:30); prep still uses the full daily forecast. Restricted sales are not normal demand."),
     "simulate_service_plan": (SimulateArgs, "Calculate a candidate. Supply every menu limit (0..100), and refer to observed result IDs. Revise using parent_candidate_id after seeing results."),
     "calculate_prep": (PrepArgs, "Calculate today's preparation, referring to this run's estimate_sales result."),
     "read_close_record": (EmptyArgs, "Read this service day's confirmed close record."),

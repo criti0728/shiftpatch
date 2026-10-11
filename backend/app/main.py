@@ -21,6 +21,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from . import operations as ops
+from .incidents import detect
+from .agent.schemas import Constraints
 from .errors import DomainError
 from .auth import SessionService
 from .repository import SQLiteIdentityRepository, SQLiteRepository, sample_state
@@ -67,6 +69,27 @@ class Adjustment(Body):
 
 class Receipt(Body):
     quantity: Quantity
+    expires_at: str | None = None
+
+    @field_validator('expires_at')
+    @classmethod
+    def valid_expiry(cls, value):
+        if value and parse_time(value).tzinfo is None:
+            raise ValueError('Timezone required')
+        return value
+
+
+class LotBody(Body):
+    ingredient_id: str
+    quantity: Quantity
+    expires_at: str
+
+    @field_validator('expires_at')
+    @classmethod
+    def valid_expiry(cls, value):
+        if parse_time(value).tzinfo is None:
+            raise ValueError('Timezone required')
+        return value
 
 
 class OrderItem(Body):
@@ -86,6 +109,12 @@ class TaskBody(Body):
 class ProposalBody(Body):
     mode: Literal["pre_open", "in_service", "post_close"]
     objective: Literal["balanced", "preserve_drinks", "reduce_delay"] = "balanced"
+    trigger_event_id: str | None = Field(default=None, max_length=100)
+    parent_run_id: str | None = Field(default=None, max_length=100)
+    service_date: str | None = None
+    constraints: Constraints = Field(default_factory=Constraints)
+    locale: Literal['ja-JP', 'ko-KR'] = 'ja-JP'
+    answers: dict[str, str] = Field(default_factory=dict, max_length=5)
 
 
 class ApprovalBody(Body):
@@ -97,6 +126,10 @@ class ModeReview(Body):
     action: Literal["release"]
 
 
+class ClockBody(Body):
+    mode: Literal["manual", "realtime"]
+
+
 class Advance(Body):
     minutes: Annotated[int, Field(strict=True, ge=1, le=120)]
 
@@ -104,6 +137,21 @@ class Advance(Body):
 class HistoryPatch(Body):
     counts: dict[str, Annotated[int, Field(strict=True, ge=0, le=1000)]]
     restricted: bool
+    windows: list[dict] | None = Field(default=None, max_length=48)
+
+    @field_validator('windows')
+    @classmethod
+    def valid_windows(cls, value):
+        from datetime import time as clock_time
+        seen = set()
+        for window in value or []:
+            if set(window) != {'start_time', 'counts'} or window['start_time'] in seen:
+                raise ValueError('Unique start_time/counts required')
+            clock_time.fromisoformat(window['start_time'])
+            seen.add(window['start_time'])
+            if not isinstance(window['counts'], dict) or any(type(c) is not int or not 0 <= c <= 1000 for c in window['counts'].values()):
+                raise ValueError('Counts must be integer quantities')
+        return value
 
 
 class FirebaseExchange(Body):
@@ -176,10 +224,23 @@ def create_app(db_path: str | Path | None = None, *, repository=None, identities
         return JSONResponse({"detail": {"code": "invalid_input", "message": "入力内容を確認してください: " + ", ".join(fields)}}, status_code=422)
 
     def store_repository(store_id: str, request: Request):
-        return sessions.require_store(request, store_id)
+        scoped = sessions.require_store(request, store_id)
+        from .clock import tick
+        if scoped.read().get('clock', {}).get('mode') == 'realtime':
+            def update_clock(state):
+                if tick(state):
+                    detect(state, 'realtime-clock')
+            scoped.transact(update_clock)
+        return scoped
 
     def present(scoped_repository, request: Request):
-        value = ops.overview(scoped_repository.read(), os.getenv("SHIFTPATCH_AI_MODE", "calculation_only"))
+        state = scoped_repository.read()
+        value = ops.overview(state, os.getenv("SHIFTPATCH_AI_MODE", "calculation_only"))
+        entries = [r for r in state.get('agent_runs', {}).values() if r['status'] == 'running']
+        active = max(entries, key=lambda r: r.get('started_at', ''), default=None)
+        if active and parse_time(active['expires_at']) <= datetime.now(timezone.utc):
+            active = {**active, 'status': 'interrupted'}
+        value['active_run'] = {k: v for k, v in active.items() if k not in {'key', 'digest'}} if active else None
         value["config"].update(storage=repository.storage_name, auth=request.state.session["user"]["kind"], sample_store=True)
         return value
 
@@ -217,6 +278,7 @@ def create_app(db_path: str | Path | None = None, *, repository=None, identities
                 return prior["result"]
             check_reserved_key(state, key)
             result = operation(state)
+            detect(state, command)
             state["idempotency"][key] = {"digest": digest, "result": result}
             return result
 
@@ -249,7 +311,12 @@ def create_app(db_path: str | Path | None = None, *, repository=None, identities
 
     @app.post("/api/stores/{store_id}/deliveries/{delivery_id}/receive")
     def receive(store_id: str, delivery_id: str, body: Receipt, idempotency_key: IdempotencyKey, request: Request, scoped_repository=Depends(store_repository)):
-        mutate(scoped_repository, idempotency_key, f"receive/{delivery_id}", body.model_dump(), lambda s: ops.receive_delivery(s, delivery_id, body.quantity))
+        mutate(scoped_repository, idempotency_key, f"receive/{delivery_id}", body.model_dump(), lambda s: ops.receive_delivery(s, delivery_id, body.quantity, body.expires_at))
+        return present(scoped_repository, request)
+
+    @app.post('/api/stores/{store_id}/inventory-lots')
+    def add_lot(store_id: str, body: LotBody, idempotency_key: IdempotencyKey, request: Request, scoped_repository=Depends(store_repository)):
+        mutate(scoped_repository, idempotency_key, 'inventory-lots', body.model_dump(), lambda s: ops.add_lot(s, body.ingredient_id, body.quantity, body.expires_at))
         return present(scoped_repository, request)
 
     @app.post("/api/stores/{store_id}/orders")
@@ -262,6 +329,11 @@ def create_app(db_path: str | Path | None = None, *, repository=None, identities
         mutate(scoped_repository, idempotency_key, f"task/{order_id}/{task_id}", body.model_dump(), lambda s: ops.update_task(s, order_id, task_id, body.status, body.staff_id))
         return present(scoped_repository, request)
 
+    @app.post('/api/stores/{store_id}/orders/{order_id}/tasks/{task_id}/reallocate')
+    def reallocate(store_id: str, order_id: str, task_id: str, body: Body, idempotency_key: IdempotencyKey, request: Request, scoped_repository=Depends(store_repository)):
+        mutate(scoped_repository, idempotency_key, 'reallocate/'+task_id, {}, lambda s: ops.reallocate_task(s, order_id, task_id))
+        return present(scoped_repository, request)
+
     @app.post("/api/stores/{store_id}/proposals")
     async def proposal(store_id: str, body: ProposalBody, idempotency_key: IdempotencyKey, request: Request, scoped_repository=Depends(store_repository)):
         digest = fingerprint("proposals", body.model_dump())
@@ -269,16 +341,75 @@ def create_app(db_path: str | Path | None = None, *, repository=None, identities
         started = datetime.now(timezone.utc)
 
         def register(state):
+            prior = state['idempotency'].get(idempotency_key)
+            if prior and prior['digest'] != digest:
+                raise DomainError('idempotency_conflict', '同じキーの入力が異なります。')
+            for old_run in state['agent_runs'].values():
+                if old_run['key'] == idempotency_key and old_run['digest'] != digest:
+                    raise DomainError('idempotency_conflict', '同じキーの入力が異なります。')
+            target = state['store']['service_date']
+            if body.mode == 'post_close':
+                target = (date.fromisoformat(target) + timedelta(days=1)).isoformat()
+            if body.service_date and body.service_date != target:
+                raise DomainError('invalid_service_date', 'このモードの対象営業日と一致しません。', 422)
+            if body.trigger_event_id:
+                incident = next((e for e in state['events'] if e['id'] == body.trigger_event_id and e['type'] == 'replan'), None)
+                if body.mode != 'in_service':
+                    raise DomainError('invalid_incident', '有効な営業中の事件ではありません。', 422)
+                for run in state['agent_runs'].values():
+                    if (run.get('trigger_event_id') == body.trigger_event_id or run.get('covered_event_id') == body.trigger_event_id):
+                        if run.get('proposal_id'):
+                            cached = deepcopy(ops.get(state['proposals'], run['proposal_id'], '提案'))
+                            if cached['status'] == 'ready' and not ops.proposal_current(cached, state):
+                                cached['status'] = 'stale'
+                            return {'cached': cached}
+                        if run['status'] == 'running' and parse_time(run['expires_at']) > started:
+                            raise DomainError('run_in_progress', 'この事件を分析中です。')
+                        raise DomainError('run_interrupted', '事件の実行が中断されました。手動で新しく分析してください。')
+                if not incident:
+                    raise DomainError('invalid_incident', '有効な事件ではありません。', 422)
+            context = body.model_dump()
+            if body.parent_run_id:
+                parent = state['agent_runs'].get(body.parent_run_id)
+                if not parent or not parent.get('proposal_id'):
+                    raise DomainError('invalid_parent', '前の実行が見つかりません。', 422)
+                old = ops.get(state['proposals'], parent['proposal_id'], '提案')
+                if old['mode'] != body.mode:
+                    raise DomainError('invalid_parent', '同じ分析モードで続けてください。', 422)
+                questions = {q['id']: q for q in old.get('questions', []) if isinstance(q, dict)}
+                for qid, answer in body.answers.items():
+                    q = questions.get(qid)
+                    if not q:
+                        raise DomainError('invalid_answer', 'この実行の質問IDではありません。', 422)
+                    field = q['field']
+                    allowed = {'objective': {'balanced', 'preserve_drinks', 'reduce_delay'}, 'allow_menu_pause': {'true', 'false'}, 'review_after_minutes': {'15', '30'}}
+                    if field in allowed:
+                        if answer not in allowed[field] or (q.get('options') and answer not in q['options']):
+                            raise DomainError('invalid_answer', '回答の選択値が不正です。', 422)
+                        if field == 'objective':
+                            context['objective'] = answer
+                        elif field == 'allow_menu_pause':
+                            context['constraints']['allow_menu_pause'] = answer == 'true'
+                        else:
+                            context['constraints']['allowed_review_minutes'] = [int(answer)]
+                    elif answer != 'updated' or state['revision'] == old['revision']:
+                        raise DomainError('facts_not_updated', '勤務・在庫などを運営画面で先に保存してください。', 422)
+                if 'objective' not in body.model_fields_set and not any(questions[qid]['field'] == 'objective' for qid in body.answers):
+                    context['objective'] = old.get('objective', 'balanced')
+                if 'constraints' not in body.model_fields_set:
+                    inherited = deepcopy(old.get('constraints', context['constraints']))
+                    inherited.update({k: v for k, v in context['constraints'].items() if any(questions[qid]['field'] == ('review_after_minutes' if k == 'allowed_review_minutes' else k) for qid in body.answers)})
+                    context['constraints'] = inherited
+                context['parent_summary'] = old['summary']
+            elif body.answers:
+                raise DomainError('invalid_answer', '回答には前の実行IDが必要です。', 422)
             prior = state["idempotency"].get(idempotency_key)
             if prior:
                 if prior["digest"] != digest:
                     raise DomainError("idempotency_conflict", "同じキーの入力が異なります。")
                 result_id = prior["result"]["proposal_id"]
                 cached = ops.get(state["proposals"], result_id, "提案")
-                if cached["status"] == "ready" and (
-                    cached["revision"] != state["revision"]
-                    or (cached.get("review_at") and ops.now(state) >= parse_time(cached["review_at"]))
-                ):
+                if cached["status"] == "ready" and not ops.proposal_current(cached, state):
                     cached["status"] = "stale"
                 return {"cached": deepcopy(cached)}
             for entry in state["agent_runs"].values():
@@ -288,14 +419,26 @@ def create_app(db_path: str | Path | None = None, *, repository=None, identities
                     if entry["status"] == "running" and parse_time(entry["expires_at"]) > started:
                         raise DomainError("run_in_progress", "同じ計算を実行中です。完了後に再確認してください。")
                     raise DomainError("run_interrupted", "この実行は中断されました。新しい操作として再計算してください。")
+            if body.mode == 'in_service' and (state.get('closed') or not ops.open_time(state) <= ops.now(state) < ops.close_time(state)):
+                raise DomainError('outside_service', '営業中に実行してください。準備または翌日計画を選択できます。')
             if any(run["status"] == "running" and parse_time(run["expires_at"]) > started for run in state["agent_runs"].values()):
                 raise DomainError("run_in_progress", "この店舗の運営案を計算中です。完了後に再実行してください。")
-            state["agent_runs"][run_id] = {"id": run_id, "key": idempotency_key, "digest": digest, "status": "running", "expires_at": iso(started+timedelta(seconds=45))}
+            state['agent_runs'][run_id] = {'id': run_id, 'key': idempotency_key, 'digest': digest, 'status': 'running',
+                'phase': 'snapshot', 'trace': [], 'started_at': iso(started), 'revision': state['revision'],
+                'parent_run_id': body.parent_run_id, 'trigger_event_id': body.trigger_event_id,
+                'expires_at': iso(started+timedelta(seconds=40))}
+            if body.mode == 'in_service' and state.get('replan_required'):
+                covered = state.get('replan_event') or {}
+                state['agent_runs'][run_id]['covered_event_id'] = covered.get('id')
+                state['replan_required'] = False
             snapshot = deepcopy(state)
             snapshot.pop("idempotency", None)
             snapshot.pop("agent_runs", None)
             # Historical proposal details aren't needed by operations, and recursive snapshots grow rapidly.
+            snapshot['proposals'] = [{k: p[k] for k in ('id', 'type', 'status', 'created_at', 'prep') if k in p} for p in snapshot['proposals']]
             snapshot["snapshot_id"] = str(uuid4())
+            snapshot["request_context"] = context
+            state["agent_runs"][run_id]["snapshot_id"] = snapshot["snapshot_id"]
             return {"snapshot": snapshot}
 
         entry = scoped_repository.transact(register)
@@ -321,16 +464,36 @@ def create_app(db_path: str | Path | None = None, *, repository=None, identities
             scoped_repository.transact(deny)
             raise
         from .agent.runner import generate_proposal
+        from .agent.dispatcher import BoundaryViolation
+        last_progress = [None, 0, 0.0]
+        def progress(phase, trace):
+            signature = (phase, len(trace))
+            if signature == tuple(last_progress[:2]) and time.monotonic() - last_progress[2] < 1:
+                return
+            def save_progress(state):
+                run = state['agent_runs'].get(run_id)
+                if not run or run.get('cancel_requested'):
+                    raise BoundaryViolation('店長が分析を中断しました。')
+                if parse_time(run["expires_at"]) <= datetime.now(timezone.utc):
+                    from .agent.dispatcher import BudgetExceeded
+                    raise BudgetExceeded("実行期限切れ")
+                if run['status'] != 'running':
+                    raise BoundaryViolation('実行が中断されました。')
+                run.update(phase=phase, trace=deepcopy(trace), updated_at=iso(datetime.now(timezone.utc)))
+            scoped_repository.transact(save_progress)
+            last_progress[:] = [phase, len(trace), time.monotonic()]
         try:
             async with asyncio.timeout(39):
-                result = await generate_proposal(snapshot, body.mode, body.objective)
+                import inspect
+                kwargs = {'progress': progress} if 'progress' in inspect.signature(generate_proposal).parameters else {}
+                result = await generate_proposal(snapshot, body.mode, snapshot['request_context']['objective'], **kwargs)
         except TimeoutError:
-            result = {"status": "failed", "error": "計算の制限時間を超えました。再実行してください。", "summary": "時間切れ", "source": os.getenv("SHIFTPATCH_AI_MODE", "calculation_only"), "candidates": [], "trace": []}
+            result = {"status": "failed", "error": "budget_exceeded", "summary": "時間切れ", "source": os.getenv("SHIFTPATCH_AI_MODE", "calculation_only"), "candidates": [], "trace": []}
         except Exception:
             logger.exception("Proposal generation failed: %s", run_id)
             result = {"status": "failed", "error": "提案の生成に失敗しました。入力または接続設定を確認してください。", "summary": "生成失敗", "source": os.getenv("SHIFTPATCH_AI_MODE", "calculation_only"), "candidates": [], "trace": []}
         proposal_id = str(uuid4())
-        result.update(id=proposal_id, run_id=run_id, mode=body.mode, type={"pre_open": "prep_plan", "in_service": "service_plan", "post_close": "next_day_plan"}[body.mode],
+        result.update(id=proposal_id, run_id=run_id, parent_run_id=body.parent_run_id, trigger_event_id=body.trigger_event_id, constraints=snapshot["request_context"]["constraints"], locale=body.locale, mode=body.mode, type={"pre_open": "prep_plan", "in_service": "service_plan", "post_close": "next_day_plan"}[body.mode],
                       revision=snapshot["revision"], created_at=snapshot["business_now"], snapshot_id=snapshot["snapshot_id"])
         result.setdefault("recommended_candidate_id", None)
         result.setdefault("review_at", iso(parse_time(snapshot["business_now"])+timedelta(minutes=30)))
@@ -343,10 +506,13 @@ def create_app(db_path: str | Path | None = None, *, repository=None, identities
                 raise DomainError("run_interrupted", "初期化または中断された実行です。再計算してください。")
             if parse_time(execution["expires_at"]) <= datetime.now(timezone.utc):
                 result.update(status="failed", recommended_candidate_id=None,
-                              error="実行の有効時間を超えました。再計算してください。", summary="実行期限切れ")
-            if result["status"] == "ready" and (state["revision"] != snapshot["revision"] or state["business_now"] != snapshot["business_now"]):
+                              error="budget_exceeded", summary="実行期限切れ")
+            if result["status"] == "ready" and (not ops.proposal_current(result, state) or (state.get("clock", {}).get("mode") != "realtime" and state["business_now"] != snapshot["business_now"])):
                 result["status"] = "stale"
-            execution["status"] = result["status"]
+            if execution.get('cancel_requested'):
+                result.update(status='failed', error='interrupted', recommended_candidate_id=None, summary='分析を中断しました。')
+            execution['status'] = ('interrupted' if result.get('error') == 'interrupted' else 'timed_out' if result.get('error') == 'budget_exceeded' else 'succeeded' if result['status'] == 'ready' else result['status'])
+            execution.update(phase=result.get('phase', execution.get('phase', 'snapshot')), trace=deepcopy(result.get('trace', [])), finished_at=iso(datetime.now(timezone.utc)))
             execution["proposal_id"] = proposal_id
             state["proposals"].insert(0, deepcopy(result))
             state["idempotency"][idempotency_key] = {"digest": digest, "result": {"proposal_id": proposal_id}}
@@ -362,6 +528,22 @@ def create_app(db_path: str | Path | None = None, *, repository=None, identities
         if entry["status"] == "running" and parse_time(entry["expires_at"]) < datetime.now(timezone.utc):
             entry["status"] = "interrupted"
         return {k: v for k, v in entry.items() if k not in {"key", "digest"}}
+
+    @app.post('/api/stores/{store_id}/agent-runs/{run_id}/cancel')
+    def cancel_run(store_id: str, run_id: str, body: Body, idempotency_key: IdempotencyKey, request: Request, scoped_repository=Depends(store_repository)):
+        def cancel(state):
+            run = state['agent_runs'].get(run_id)
+            if not run:
+                raise DomainError('not_found', '実行が見つかりません。', 404)
+            if run['status'] == 'running':
+                run['cancel_requested'] = True
+            return {'ok': True}
+        return mutate(scoped_repository, idempotency_key, 'cancel/'+run_id, {}, cancel)
+
+    @app.post('/api/stores/{store_id}/proposals/{proposal_id}/dismiss')
+    def dismiss(store_id: str, proposal_id: str, body: Body, idempotency_key: IdempotencyKey, request: Request, scoped_repository=Depends(store_repository)):
+        mutate(scoped_repository, idempotency_key, 'dismiss/'+proposal_id, {}, lambda s: ops.dismiss(s, proposal_id))
+        return present(scoped_repository, request)
 
     @app.post("/api/stores/{store_id}/proposals/{proposal_id}/approve")
     def approve(store_id: str, proposal_id: str, body: ApprovalBody, idempotency_key: IdempotencyKey, request: Request, scoped_repository=Depends(store_repository)):
@@ -385,7 +567,17 @@ def create_app(db_path: str | Path | None = None, *, repository=None, identities
 
     @app.patch("/api/stores/{store_id}/history/{business_date}")
     def history(store_id: str, business_date: str, body: HistoryPatch, idempotency_key: IdempotencyKey, request: Request, scoped_repository=Depends(store_repository)):
-        mutate(scoped_repository, idempotency_key, f"history/{business_date}", body.model_dump(), lambda s: ops.update_history(s, business_date, body.counts, body.restricted))
+        mutate(scoped_repository, idempotency_key, f"history/{business_date}", body.model_dump(), lambda s: ops.update_history(s, business_date, body.counts, body.restricted, body.windows))
+        return present(scoped_repository, request)
+
+    @app.post('/api/stores/{store_id}/clock')
+    def clock_mode(store_id: str, body: ClockBody, idempotency_key: IdempotencyKey, request: Request, scoped_repository=Depends(store_repository)):
+        from .clock import set_mode
+        def change(state):
+            set_mode(state, body.mode)
+            ops.bump(state)
+            return {'ok': True}
+        mutate(scoped_repository, idempotency_key, 'clock-mode', body.model_dump(), change)
         return present(scoped_repository, request)
 
     @app.post("/api/stores/{store_id}/demo/advance")

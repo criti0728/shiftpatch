@@ -189,14 +189,14 @@ def test_reset_keeps_revision_monotonic_and_survives_restart(client, tmp_path):
 
 
 def test_inflight_proposal_key_cannot_be_reused_by_a_write_or_reset(client):
-    from app.main import fingerprint
+    from app.main import fingerprint, ProposalBody
     from app.timeutils import iso
     key = str(uuid4())
     body = {"mode": "in_service", "objective": "balanced"}
 
     def register(state):
         state["agent_runs"]["pending-test"] = {
-            "id": "pending-test", "key": key, "digest": fingerprint("proposals", body),
+            "id": "pending-test", "key": key, "digest": fingerprint("proposals", ProposalBody.model_validate(body).model_dump()),
             "status": "running", "expires_at": iso(datetime.now(timezone.utc) + timedelta(seconds=45)),
         }
 
@@ -306,6 +306,6 @@ def test_run_expired_before_final_save_cannot_become_ready(client, monkeypatch):
     assert response.status_code == 200
     result = response.json()
     assert result["status"] == "failed"
-    assert "有効時間" in result["error"]
+    assert result["error"] == "budget_exceeded"
     run = client.get(BASE + f"/agent-runs/{result['run_id']}").json()
-    assert run["status"] == "failed"
+    assert run["status"] == "timed_out"

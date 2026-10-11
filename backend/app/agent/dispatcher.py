@@ -22,10 +22,14 @@ class BudgetExceeded(AgentError):
 
 
 class Dispatcher:
-    def __init__(self, snapshot, mode, trace, *, max_tools=12, max_candidates=5):
+    def __init__(self, snapshot, mode, trace, *, max_tools=12, max_candidates=5, progress=None, constraints=None):
         self.snapshot = deepcopy(snapshot)
         self.mode = mode
         self.trace = trace
+        from app.inventory import migrate
+        migrate(self.snapshot)
+        self.progress = progress
+        self.constraints = constraints or {"allowed_review_minutes": [15, 30], "allow_menu_pause": True}
         self.started = monotonic()
         self.tools = allowed_tools(mode)
         self.results: dict[str, dict] = {}
@@ -40,7 +44,12 @@ class Dispatcher:
 
     def record(self, name, args, data, origin="model", *, cached=False):
         result_id = f"result-{len(self.results) + 1}"
-        result = {"result_id": result_id, "tool": name, "data": deepcopy(data)}
+        failed = isinstance(data, dict) and 'error' in data
+        result = {"result_id": result_id, "tool": name, "tool_name": name, "data": deepcopy(data),
+                  "call_id": f"call-{len(self.trace)+1}", "snapshot_id": self.snapshot.get('snapshot_id'),
+                  "status": ('invalid_candidate' if name == 'simulate_service_plan' else 'error') if failed else 'ok',
+                  "evidence_refs": [result_id], "warnings": data.get('notes', []) if isinstance(data, dict) else [],
+                  "error": {'code': 'invalid_input', 'message': data['error'], 'retryable': bool(data.get('recoverable'))} if failed else None}
         self.results[result_id] = result
         if isinstance(data, dict) and "metrics" in data:
             summary = json.dumps(data["metrics"], ensure_ascii=False)
@@ -53,6 +62,8 @@ class Dispatcher:
             "args": deepcopy(args), "result_id": result_id, "result_summary": summary,
             "elapsed_ms": round((monotonic() - self.started) * 1000), "cached": cached,
         })
+        if self.progress:
+            self.progress('calculate' if name in {'simulate_service_plan', 'baseline_simulation', 'calculate_prep', 'calculate_next_day_prep', 'estimate_sales', 'compare_plan_actual'} else 'investigate', self.trace)
         return result
 
     def require_result(self, result_id, tool=None):
@@ -75,6 +86,11 @@ class Dispatcher:
                 raise ValueError("全メニューの上限を明示してください。")
             if any(type(value) is not int or value < 0 or value > 100 for value in spec["limits"].values()):
                 raise ValueError("メニュー上限は0〜100の整数で指定してください。")
+        if origin == 'model':
+            if spec['review_after_minutes'] not in self.constraints['allowed_review_minutes']:
+                raise ValueError('許可された見直し間隔を指定してください。')
+            if not self.constraints['allow_menu_pause'] and any(v == 0 for v in spec['limits'].values()):
+                raise ValueError('今回はメニューの販売停止が許可されていません。')
         parent = spec.get("parent_candidate_id")
         if parent and parent not in {item["id"] for item in self.candidates}:
             raise ValueError("修正元の候補がこの実行に存在しません。")
@@ -90,10 +106,12 @@ class Dispatcher:
                 return candidate
         if len(self.candidates) >= self.max_candidates:
             raise BudgetExceeded("比較候補の上限に達しました。")
-        candidate = {"id": f"candidate-{len(self.candidates) + 1}", **spec, "origin": origin}
+        from app.timeutils import iso, parse_time
+        candidate = {"id": f"candidate-{len(self.candidates) + 1}", **spec, "origin": origin,
+                     "valid_until": iso(parse_time(self.snapshot['business_now']) + timedelta(minutes=spec['review_after_minutes']))}
         # Separate copy keeps accidental calculator mutations away from the snapshot.
         calculated = simulate(deepcopy(self.snapshot), deepcopy(candidate), horizon_minutes=30, seed=42)
-        candidate.update(metrics=calculated["metrics"], feasible=calculated["feasible"], notes=calculated["notes"])
+        candidate.update(metrics=calculated["metrics"], feasible=calculated["feasible"], notes=calculated["notes"], existing_commitments_at_risk=calculated["existing_commitments_at_risk"])
         self.candidates.append(candidate)
         return candidate
 
@@ -113,7 +131,11 @@ class Dispatcher:
         if forbidden.intersection(args):
             self.record(name, {}, {"error": "権限・スナップショット引数を指定することはできません。"})
             raise BoundaryViolation("権限・スナップショット引数を拒否しました。")
-        key = json.dumps([name, args], sort_keys=True, ensure_ascii=False)
+        try:
+            normalized = self.tools[name][0].model_validate(args).model_dump()
+        except ValidationError:
+            normalized = args
+        key = json.dumps([name, normalized], sort_keys=True, ensure_ascii=False)
         if len(key) > 12_000:
             raise BoundaryViolation("ツール引数のサイズ上限を超えました。")
         if key in self.cache:
@@ -139,6 +161,7 @@ class Dispatcher:
         return deepcopy(result)
 
     def _invoke(self, name, args):
+        from app.timeutils import parse_time
         state = self.snapshot
         if name in {"read_shift", "estimate_sales"}:
             if args["service_date"] is not None and args["service_date"] != self.date:
@@ -163,7 +186,14 @@ class Dispatcher:
                     "deliveries": [delivery for delivery in state["deliveries"]
                                    if not args["ingredient_ids"] or delivery["ingredient_id"] in args["ingredient_ids"]]}
         if name == "read_queue":
-            return {"orders": [order for order in state["orders"] if order["status"] in args["statuses"]]}
+            orders = deepcopy([order for order in state['orders'] if order['status'] in args['statuses']])
+            from app.timeutils import parse_time
+            at = parse_time(state['business_now'])
+            for order in orders:
+                order['elapsed_wait_seconds'] = max(0, (at-parse_time(order['created_at'])).total_seconds())
+                for task in order['tasks']:
+                    task['remaining_seconds'] = max(0, task['duration_seconds'] - (at-parse_time(task['started_at'])).total_seconds()) if task.get('started_at') and task.get('duration_seconds') else None
+            return {'orders': orders}
         if name == "read_current_mode":
             return deepcopy(state["mode"])
         if name == "read_menu_recipes":
@@ -171,11 +201,20 @@ class Dispatcher:
         if name == "simulate_service_plan":
             return self.candidate(args["candidate_spec"])
         if name == "estimate_sales":
-            from app.planning.forecast import forecast_sales
+            from app.planning.forecast import forecast_sales, forecast_windows
             forecast, notes = forecast_sales(deepcopy(state), service_date=self.date)
+            windows = forecast_windows(state, self.date)[0]
+            if args.get('start_time') or args.get('end_time'):
+                from app.planning.forecast import service_window
+                start, end = service_window(state, self.date)
+                left = args.get('start_time') or start.strftime('%H:%M')
+                right = args.get('end_time') or end.strftime('%H:%M')
+                if not start.strftime('%H:%M') <= left < right <= end.strftime('%H:%M'):
+                    raise ValueError('対象営業区間内の時刻を指定してください。')
+                windows = [w for w in windows if left <= parse_time(w['start_at']).astimezone(start.tzinfo).strftime('%H:%M') < right]
             rows = sorted((item for item in state["history"] if item.get("date", "") < self.date),
                           key=lambda item: item.get("date", ""), reverse=True)[:7]
-            return {"service_date": self.date, "forecast": forecast,
+            return {"service_date": self.date, "forecast": forecast, "windows": windows, "window_forecast": {m["id"]: sum(w["counts"][m["id"]] for w in windows) for m in state["menus"]},
                     "sample_count": sum(not item.get("restricted", False) for item in rows),
                     "restricted_sample_count": sum(bool(item.get("restricted", False)) for item in rows),
                     "notes": notes}
@@ -199,6 +238,8 @@ class Dispatcher:
                     "forecast": forecast,
                     "forecast_source": forecast_source,
                     "forecast_proposal_id": close.get("forecast_proposal_id"),
+                    "actual_windows": close.get('windows', []), "forecast_windows": close.get('forecast_windows', []),
+                    "operational_events": close.get('events', []), "closing_mode": close.get('mode', {}),
                     "errors": {key: actual.get(key, 0) - value for key, value in forecast.items()},
                     "restricted": bool(close.get("restricted", False)),
                     "notes": notes}

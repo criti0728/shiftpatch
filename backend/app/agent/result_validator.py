@@ -3,6 +3,18 @@ from .schemas import FinalAnswer
 
 def validate_final(raw, dispatcher):
     answer = FinalAnswer.model_validate(raw)
+    from .schemas import Question
+    import re
+    for text in [answer.summary] + [v for note in answer.candidate_notes for v in (note.summary, note.tradeoff)]:
+        if re.search(r'[0-9０-９]+(?:[.,][0-9０-９]+)?\s*(?:円|分|秒|点|個|杯|%|％|mL|kg|g\b|원|초|개)|[¥₩]\s*[0-9０-９]', text):
+            raise ValueError('数量・時間・金額は説明文に生成せず、計算結果の表示を使用してください。')
+    ids = [q.id for q in answer.questions if isinstance(q, Question)]
+    if len(ids) != len(set(ids)):
+        raise ValueError('質問IDが重複しています。')
+    options = {'objective': {'balanced', 'preserve_drinks', 'reduce_delay'}, 'allow_menu_pause': {'true', 'false'}, 'review_after_minutes': {'15', '30'}}
+    for q in answer.questions:
+        if isinstance(q, Question) and q.field in options and not set(q.options) <= options[q.field]:
+            raise ValueError('質問の選択肢は許可された設定値を使用してください。')
     for result_id in answer.evidence_refs:
         dispatcher.require_result(result_id)
     known = {candidate["id"]: candidate for candidate in dispatcher.candidates}
@@ -20,6 +32,8 @@ def validate_final(raw, dispatcher):
             raise ValueError("確認待ち・実行不能の結果に推奨候補は設定できません。")
         if answer.outcome == "needs_input" and not answer.questions:
             raise ValueError("不足している入力を質問に明示してください。")
+        if dispatcher.mode == "in_service" and answer.outcome == "no_feasible_plan" and not known:
+            raise ValueError("実行不能と判断する計算結果が必要です。")
         if answer.outcome == "no_feasible_plan" and any(c["feasible"] for c in known.values()):
             raise ValueError("実行可能な計算候補があるため、全案実行不能とは確定できません。")
         return answer

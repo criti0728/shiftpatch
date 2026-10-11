@@ -20,6 +20,8 @@ logger = logging.getLogger(__name__)
 MAX_MODEL_CALLS = 6
 MAX_TOOLS = 12
 MAX_CANDIDATES = 5
+MAX_REQUESTED_TOOLS = 24
+MAX_TOOLS_PER_REPLY = 4
 TOTAL_SECONDS = 40
 SAVE_RESERVE_SECONDS = 5
 MAX_MODEL_INPUT_CHARACTERS = 120_000
@@ -58,6 +60,7 @@ def _initial_context(snapshot, mode, objective, baseline, target_date):
                     "waiting_orders": sum(o["status"] != "completed" for o in snapshot["orders"]),
                     "inventory_mismatch_count": sum(i["on_hand"] < i["reserved"] for i in snapshot["inventory"])},
         "recent_events": snapshot.get("events", [])[:3],
+        "request_context": snapshot.get('request_context', {}),
         "baseline": baseline,
     }
 
@@ -119,6 +122,20 @@ def _record_usage(proposal, usage):
             totals[key] = totals.get(key, 0) + count
 
 
+def structured_questions(questions):
+    from .schemas import Question
+    result = []
+    for index, q in enumerate(questions):
+        if isinstance(q, Question):
+            result.append(q.model_dump())
+        elif isinstance(q, dict):
+            result.append(q)
+        else:
+            field = 'close' if '締め' in q else 'next_day_staff' if '翌' in q else 'history' if '販売数' in q else 'staff'
+            result.append({'id': f'input-{index+1}', 'text': q, 'field': field, 'options': []})
+    return result
+
+
 async def _run_model(dispatcher, proposal, objective, transport, started):
     baseline = dispatcher.baseline() if dispatcher.mode == "in_service" else None
     if baseline:
@@ -128,6 +145,7 @@ async def _run_model(dispatcher, proposal, objective, transport, started):
     system = system_prompt(dispatcher.mode)
     specs = declarations(dispatcher.mode)
     repairs = 0
+    requested_tools = 0
     for index in range(MAX_MODEL_CALLS):
         remaining = TOTAL_SECONDS - SAVE_RESERVE_SECONDS - (monotonic() - started)
         if remaining <= 0:
@@ -136,9 +154,23 @@ async def _run_model(dispatcher, proposal, objective, transport, started):
             raise BudgetExceeded("モデルに渡すデータ量の上限に達しました。対象を絞って再実行してください。")
         if proposal.get("token_usage", {}).get("total_token_count", 0) >= MAX_REPORTED_TOTAL_TOKENS:
             raise BudgetExceeded("モデルの累積トークン利用量が上限に達しました。")
+        proposal['phase'] = 'explain' if len(dispatcher.candidates) >= 3 or any(r['tool'].startswith('calculate_') for r in dispatcher.results.values()) else 'investigate'
+        if dispatcher.progress:
+            dispatcher.progress(proposal['phase'], dispatcher.trace)
         proposal["model_calls"] = index + 1
         try:
-            reply = await asyncio.wait_for(transport.generate(messages, system, specs), timeout=remaining)
+            pending = asyncio.create_task(transport.generate(messages, system, specs))
+            try:
+                async with asyncio.timeout(remaining):
+                    while not pending.done():
+                        await asyncio.wait({pending}, timeout=0.5)
+                        if dispatcher.progress:
+                            dispatcher.progress(proposal['phase'], dispatcher.trace)
+                    reply = await pending
+            finally:
+                if not pending.done():
+                    pending.cancel()
+                    await asyncio.gather(pending, return_exceptions=True)
         except TimeoutError as exc:
             raise BudgetExceeded("モデル応答が制限時間に達しました。再実行してください。") from exc
         except (ValueError, ConnectionError, OSError) as exc:
@@ -153,14 +185,20 @@ async def _run_model(dispatcher, proposal, objective, transport, started):
         _record_usage(proposal, reply.usage)
         messages.append(_reply_content(reply))
         if reply.calls:
-            if len(reply.calls) > MAX_TOOLS or reply.final is not None:
+            requested_tools += len(reply.calls)
+            proposal["requested_tool_calls"] = requested_tools
+            if len(reply.calls) > MAX_TOOLS_PER_REPLY or requested_tools > MAX_REQUESTED_TOOLS or reply.final is not None:
                 raise BoundaryViolation("1応答のツール呼出し数または応答形式が不正です。")
             responses = []
             for call in reply.calls:
                 if monotonic() - started >= TOTAL_SECONDS - SAVE_RESERVE_SECONDS:
                     raise BudgetExceeded("分析の制限時間に達しました。")
+                if dispatcher.progress:
+                    dispatcher.progress('calculate' if call.name in {'simulate_service_plan', 'calculate_prep', 'calculate_next_day_prep', 'estimate_sales', 'compare_plan_actual'} else 'investigate', dispatcher.trace)
                 result = dispatcher.execute(call.name, call.args)
+                result['call_id'] = call.id or result['call_id']
                 dispatcher.trace[-1]["model_call"] = index + 1
+                dispatcher.trace[-1]["call_id"] = result["call_id"]
                 function_response = {"name": call.name, "response": result}
                 if call.id:
                     function_response["id"] = call.id
@@ -168,6 +206,9 @@ async def _run_model(dispatcher, proposal, objective, transport, started):
             messages.append({"role": "user", "parts": responses})
             continue
         try:
+            proposal['phase'] = 'validate'
+            if dispatcher.progress:
+                dispatcher.progress('validate', dispatcher.trace)
             answer = validate_final(reply.final, dispatcher)
         except (ValueError, TypeError) as exc:
             if repairs >= 1:
@@ -181,7 +222,7 @@ async def _run_model(dispatcher, proposal, objective, transport, started):
         proposal.update(
             status="waiting_input" if answer.outcome == "needs_input" else "ready",
             recommended_candidate_id=answer.recommended_candidate_id,
-            summary=answer.summary, questions=answer.questions,
+            summary=answer.summary, questions=structured_questions(answer.questions),
             outcome=answer.outcome, evidence_refs=answer.evidence_refs,
         )
         for note in answer.candidate_notes:
@@ -196,7 +237,7 @@ async def _run_model(dispatcher, proposal, objective, transport, started):
 
 
 async def generate_proposal(snapshot: dict, mode: str, objective: str, *,
-                            transport: ModelTransport | None = None) -> dict:
+                            transport: ModelTransport | None = None, progress=None) -> dict:
     """Generate without writes. Caller owns authorization, storage and revision checks.
 
     An injected transport exercises the Gemini contract in tests only. Runtime mode
@@ -220,13 +261,15 @@ async def generate_proposal(snapshot: dict, mode: str, objective: str, *,
         "objective": objective, "prompt_version": PROMPT_VERSION, "model_calls": 0,
         "snapshot_id": snapshot.get("snapshot_id") or f"snapshot-{uuid4().hex}",
         "scenario_seed": 42, "engine_version": ENGINE_VERSION,
-        "token_usage": {},
+        "token_usage": {}, "phase": "snapshot",
     }
     questions = _missing_inputs(snapshot, mode)
     if questions:
-        proposal.update(status="waiting_input", questions=questions, summary="不足している運営データを確認してください。")
+        proposal.update(status="waiting_input", questions=structured_questions(questions), summary="不足している運営データを確認してください。")
         return proposal
-    dispatcher = Dispatcher(snapshot, mode, proposal["trace"], max_tools=MAX_TOOLS, max_candidates=MAX_CANDIDATES)
+    private_snapshot = deepcopy(snapshot)
+    private_snapshot["snapshot_id"] = proposal["snapshot_id"]
+    dispatcher = Dispatcher(private_snapshot, mode, proposal["trace"], max_tools=MAX_TOOLS, max_candidates=MAX_CANDIDATES, progress=progress, constraints=snapshot.get("request_context", {}).get("constraints"))
     own_transport = None
     try:
         async with asyncio.timeout(TOTAL_SECONDS):
@@ -238,6 +281,9 @@ async def generate_proposal(snapshot: dict, mode: str, objective: str, *,
                     transport = own_transport
                 proposal["model_id"] = getattr(transport, "model", "injected-test-transport")
                 await _run_model(dispatcher, proposal, objective, transport, started)
+            proposal['phase'] = 'validate'
+            if dispatcher.progress:
+                dispatcher.progress('validate', dispatcher.trace)
             if monotonic() - started >= TOTAL_SECONDS:
                 raise BudgetExceeded("分析の制限時間に達しました。")
     except (TimeoutError, BudgetExceeded) as exc:
@@ -247,7 +293,7 @@ async def generate_proposal(snapshot: dict, mode: str, objective: str, *,
         proposal.update(status="failed", error="agent_failed", recommended_candidate_id=None, summary=str(exc))
     except Exception:
         # Authentication/provider errors should not leak credentials or turn into a fake success.
-        logger.exception("Agent execution failed")
+        logger.error("Agent execution failed (provider details suppressed)")
         proposal.update(status="failed", recommended_candidate_id=None,
                         error="model_unavailable" if source == "gemini" else "calculation_failed",
                         summary="Geminiへの接続に失敗しました。認証・モデル・プロジェクト設定を確認してください。"
