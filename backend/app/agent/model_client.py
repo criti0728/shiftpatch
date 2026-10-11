@@ -32,27 +32,45 @@ class ModelTransport(Protocol):
 
 
 class GeminiTransport:
-    """Gemini through the Google Cloud platform, using ADC rather than an API key."""
+    """Google native Gemini API; Developer API key or Cloud ADC authentication."""
 
     def __init__(self):
-        keys = ("GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION", "SHIFTPATCH_GEMINI_MODEL")
-        missing = [key for key in keys if not os.environ.get(key, "").strip()]
-        if missing:
-            raise ValueError("Gemini設定が不足しています: " + ", ".join(missing))
+        from urllib.parse import urlparse
         from google import genai
         from google.genai import types
-        self.model = os.environ["SHIFTPATCH_GEMINI_MODEL"]
+        self.model = os.getenv('SHIFTPATCH_GEMINI_MODEL', '').strip()
+        if not self.model:
+            raise ValueError('Gemini設定が不足しています: SHIFTPATCH_GEMINI_MODEL, GOOGLE_CLOUD_PROJECT (Cloud認証の場合)')
+        provider = os.getenv('SHIFTPATCH_GEMINI_PROVIDER', 'auto')
+        key = os.getenv('GEMINI_API_KEY') or os.getenv('GOOGLE_API_KEY')
+        if provider == 'auto':
+            provider = 'developer' if key else 'vertex'
+        if provider not in {'developer', 'vertex'}:
+            raise ValueError('SHIFTPATCH_GEMINI_PROVIDER は developer / vertex / auto です。')
+        endpoint = os.getenv('SHIFTPATCH_GEMINI_ENDPOINT', '').strip()
+        if endpoint:
+            parsed = urlparse(endpoint)
+            if not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment or (parsed.scheme != 'https' and not (parsed.scheme == 'http' and parsed.hostname in {'localhost', '127.0.0.1', '::1'})):
+                raise ValueError('Gemini endpoint はHTTPSのベースURL（ローカルのみHTTP可）を指定してください。')
+            if ':generateContent' in endpoint or '/models/' in parsed.path:
+                raise ValueError('モデルの完全なURLではなくAPIのベースURLを指定してください。')
         self.last_usage = {}
-        # Both SDK generations still address the Google Cloud model platform.
-        selector = "enterprise" if "enterprise" in inspect.signature(genai.Client).parameters else "vertexai"
-        self.client = genai.Client(
-            **{selector: True}, project=os.environ["GOOGLE_CLOUD_PROJECT"],
-            location=os.environ["GOOGLE_CLOUD_LOCATION"],
-            http_options=types.HttpOptions(
-                api_version="v1", timeout=30_000,
-                retry_options=types.HttpRetryOptions(attempts=1),
-            ),
+        options = types.HttpOptions(
+            api_version=os.getenv('SHIFTPATCH_GEMINI_API_VERSION', 'v1beta' if provider == 'developer' else 'v1'),
+            base_url=endpoint or None, timeout=30_000,
+            retry_options=types.HttpRetryOptions(attempts=1),
         )
+        if provider == 'developer':
+            if not key:
+                raise ValueError('Gemini設定が不足しています: GEMINI_API_KEY')
+            self.client = genai.Client(api_key=key, http_options=options)
+        else:
+            missing = [name for name in ('GOOGLE_CLOUD_PROJECT', 'GOOGLE_CLOUD_LOCATION') if not os.getenv(name)]
+            if missing:
+                raise ValueError('Gemini設定が不足しています: ' + ', '.join(missing))
+            selector = 'enterprise' if 'enterprise' in inspect.signature(genai.Client).parameters else 'vertexai'
+            self.client = genai.Client(**{selector: True}, project=os.environ['GOOGLE_CLOUD_PROJECT'],
+                                       location=os.environ['GOOGLE_CLOUD_LOCATION'], http_options=options)
 
     async def generate(self, messages, system_instruction, declarations):
         from google.genai import types
