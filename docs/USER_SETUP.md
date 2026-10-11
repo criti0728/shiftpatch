@@ -22,7 +22,7 @@
 | 주문·근무·재고·후보 승인·마감 | 완료 | 기존 운영 테스트 및 새 개인 매장 경로 확인 |
 | 로컬 SQLite 영속 저장 | 완료 | 재시작·트랜잭션·중복 요청 테스트 |
 | Firestore 영속 저장 | 완료 | 실제 SDK·protobuf 및 트랜잭션 재시도 테스트, 원격 DB는 설정 후 확인 필요 |
-| Cloud Run 컨테이너·웹/API 통합 | 완료 | 로컬 이미지 빌드·컨테이너 실행 검증은 README 검증 기록 참조 |
+| Cloud Run 컨테이너·웹/API 통합 | 코드 완료 | 정적 웹/API 통합 테스트 통과. Docker 빌드는 로컬 Docker 저장소의 I/O 오류로 완료하지 못함 |
 | 공개 배포 스크립트 | 완료 | 설정 생성·명령/REST 계약 확인, 실제 프로젝트 배포는 준비 후 실행 |
 | Gemini 도구 선택·후보 수정 루프 | 완료 | 계약 테스트, 실제 모델 호출·품질은 프로젝트 연결 후 확인 필요 |
 | 호출 한도·만료 정리·브라우저 직접 DB 접근 차단 | 완료 | 지속되는 사용량 제한과 격리 테스트, 원격 Rules·TTL는 배포 시 적용 |
@@ -146,3 +146,10 @@ Google 로그인을 나중에 연결하려면 `--firebase-config` 없이 게스�
 7. 재고 부족·직원 결원 각각 다른 조회/후보가 나오는지 확인하고 해커톤 제출용 기록 확보.
 
 실제 Cloud Run·원격 Firestore·Google 로그인·Gemini 응답 품질은 프로젝트가 없어서 아직 실환경 검증하지 않았다. 코드·로컬 테스트·배포 준비와 실제 배포 완료를 구분한다.
+
+
+## API 키로 먼저 Gemini 검증하기
+
+Google Cloud 프로젝트가 없어도 로컬 에이전트 검증은 가능하다. `.env`에 `SHIFTPATCH_AI_MODE=gemini`, `SHIFTPATCH_GEMINI_PROVIDER=developer`, `GEMINI_API_KEY`, `SHIFTPATCH_GEMINI_MODEL`을 넣는다. 공식 API는 endpoint를 생략한다. 별도 네이티브 Gemini 프록시는 `SHIFTPATCH_GEMINI_ENDPOINT`로 지정한다. URL만으로는 인증할 수 없다. 설정 후 서버를 재시작하고 `.venv/bin/python scripts/verify_gemini.py`를 실행한다. [검증 절차와 판정](GEMINI_VALIDATION.md)
+
+로컬 검증 성공은 Cloud Run 배포를 대신하지 않는다. 실제 Google 로그인·Firestore·공개 배포 조건은 위 프로젝트 설정 절차로 따로 검증한다.

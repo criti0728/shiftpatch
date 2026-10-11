@@ -4,7 +4,7 @@
 
 - 작성일: 2026-10-04
 - 기준: 2인 개발, 14일 MVP, 일본 개인 카페 1개
-- 상태: 목표 아키텍처. 2026-10-11 로컬 MVP를 구현했으며 실제 실행 범위는 [README.md](README.md), 에이전트 구현은 [docs/AGENT_IMPLEMENTATION.md](docs/AGENT_IMPLEMENTATION.md)에 기록한다. 아래의 Cloud Run·Firebase 배포 항목은 개발 계획이며 완료 실적을 의미하지 않는다.
+- 상태: 목표 설계와 구현 결정. 2026-10-11 사용자별 샘플 체험·게스트 세션·Firebase 로그인 연결·Firestore 저장·Cloud Run 배포 코드를 구현했다. 실제 클라우드 배포·인증·모델 호출은 프로젝트 설정 후 검증해야 한다. 현재 범위는 [README.md](README.md), 사용자 준비 항목은 [docs/USER_SETUP.md](docs/USER_SETUP.md), 에이전트 구현은 [docs/AGENT_IMPLEMENTATION.md](docs/AGENT_IMPLEMENTATION.md)에 기록한다. 2026-10-11 후속 구현으로 사건별 자동 요청·진행 단계·질문 답변 연결·로트별 FIFO·시간대별 수요·실호출 검증 명령을 추가했다. 이 문서의 POS·발주처 연동 등 장기 범위와 실제 클라우드 검증 완료를 의미하지는 않는다.
 - 반영 자료: ShiftPatch 기획서 및 사용자가 제공한 해커톤 개발 프로젝트 조건
 
 ## 1. 설계 결정
@@ -32,7 +32,7 @@
 | --- | --- | --- | --- |
 | 필수: Google Cloud 애플리케이션 실행 | **Cloud Run** | FastAPI API, 계산 엔진, 에이전트 실행 | 배포 서비스·리비전, API 호출 기록, 동작 화면 |
 | 필수: Google Cloud AI | **Gemini API — Gemini Enterprise Agent Platform 경유** | 운영 데이터 조회 도구 선택, 운영안 비교, 근거·마감 피드백 생성 | 서버의 모델 호출 코드, 사용 모델·호출 기록, 상황별 결과 |
-| 선택: Firebase | **Firebase Hosting** | React 웹 정적 파일 제공 | 배포 URL 및 Hosting 설정 |
+| 웹 제공 | **Cloud Run** | React 정적 웹과 API를 같은 서비스에서 제공 | 공개 URL 및 정적 웹/API 동작 |
 | 선택: Firebase | **Firebase Authentication** | 점장 로그인 | 로그인 흐름 및 서버 토큰 검증 |
 | 선택: Firebase | **Cloud Firestore** | 운영 데이터, 재료 예약, 제안·적용 이력 저장 | 데이터 구조와 트랜잭션 구현 |
 
@@ -42,7 +42,7 @@ AI 호출은 Cloud Run 서버에서 Google Cloud 프로젝트의 플랫폼 경�
 
 제출 설명 초안은 다음과 같다. 실제 구현·배포 후 확인된 내용으로 확정한다.
 
-> ShiftPatch는 Cloud Run에서 운영 API와 Python 시뮬레이션 엔진을 실행하고, Gemini Enterprise Agent Platform 경유 Gemini API로 인력·재고·주문 상황에 맞는 운영안을 제안합니다. Firebase Hosting, Authentication, Firestore를 이용해 웹 화면, 로그인, 운영 기록과 승인 이력을 관리합니다.
+> ShiftPatch는 Cloud Run에서 웹·운영 API·Python 시뮬레이션 엔진을 실행하고, Gemini Enterprise Agent Platform 경유 Gemini API로 인력·재고·주문 상황에 맞는 운영안을 제안합니다. 방문자마다 샘플 매장을 제공하며 Firebase Authentication과 Firestore로 선택적 Google 로그인, 운영 기록과 승인 이력을 관리합니다.
 
 ## 3. MVP 범위
 
@@ -65,7 +65,7 @@ AI 호출은 Cloud Run 서버에서 Google Cloud 프로젝트의 플랫폼 경�
 ```mermaid
 flowchart TD
     USER["점장 · 데모 주문 사용자"]
-    WEB["Firebase Hosting<br/>React · TypeScript"]
+    WEB["Cloud Run 정적 웹<br/>React · TypeScript"]
     AUTH["Firebase Authentication"]
 
     subgraph RUN["Cloud Run · FastAPI 단일 서비스"]
@@ -81,7 +81,7 @@ flowchart TD
 
     USER --> WEB
     WEB --> AUTH
-    WEB -->|"ID 토큰 포함 API 요청"| API
+    WEB -->|"게스트 또는 검증된 계정 세션"| API
     API --> OPS
     API --> AGENT
     API -->|"점장 승인 요청"| APPROVAL
@@ -103,16 +103,16 @@ flowchart TD
 | 영역 | 선택 | 역할·선택 이유 |
 | --- | --- | --- |
 | 웹 | React + TypeScript + Vite | 점장 운영 화면과 데모 주문 화면을 하나의 웹 프로젝트로 구현 |
-| UI | Tailwind CSS + shadcn/ui | 표·폼·모달·후보 비교 화면 구성 |
+| UI | 자체 CSS + Lucide | 화이트·네이비 표·폼·모달·후보 비교 화면 구성 |
 | 서버 상태 | TanStack Query | 조회, 재조회, 변경 후 갱신, 로딩·실패 처리 |
 | API | Python + FastAPI + Pydantic | API 입력 검증, 응답 형식, 계산·AI 코드 통합 |
 | AI SDK | Google Gen AI SDK for Python | 플랫폼 경유 Gemini 호출과 함수 호출 연결 |
 | 모델 | 함수 호출·구조화 출력을 지원하는 Gemini Flash 계열 후보 | 평가 상황으로 품질·응답 시간을 확인한 뒤 모델 ID 고정 |
 | 계산 | Python 표준 라이브러리 중심의 이벤트 시뮬레이터 | 직원·작업대 배정과 후보별 결과를 재현 가능하게 구현 |
-| 저장 | Firestore | 매장 1개 범위의 운영 기록과 원자적 상태 변경 |
+| 저장 | 로컬 SQLite / 공개 Firestore | 사용자별 샘플 운영 기록과 원자적 상태 변경 |
 | 인증 | Firebase Authentication | 로그인과 ID 토큰 발급 |
 | 실행 | Cloud Run + Docker | API·계산·에이전트 통합 실행 |
-| 웹 배포 | Firebase Hosting | 정적 웹 제공, `/api/**`를 Cloud Run으로 연결 |
+| 웹 배포 | Cloud Run | React 정적 웹과 API를 같은 Origin에서 제공 |
 | 검증 | pytest + Playwright | 계산·트랜잭션 검증 및 핵심 사용자 흐름 재현 |
 | 로그 | Cloud Logging | 요청·모델 호출·승인·실패 추적 |
 
@@ -657,7 +657,7 @@ POST /orders
 4. 최종 트랜잭션에서 버전을 다시 확인하고 승인 이력·현재 판매 설정을 함께 저장한다.
 5. 적용 결과를 재조회해 화면에 표시한다.
 
-MVP는 매장 단위 `state_revision`으로 시작하며, 계산에 영향을 주는 상태 변경 시 같은 트랜잭션에서 증가시킨다. 입력 스냅샷도 이 버전과 데이터가 일치하도록 읽는다. 시간 경과·근무 종료·로트 만료는 승인 시 현재 영업 시각으로 추가 확인한다.
+MVP는 매장 단위 `state_revision`으로 시작하며, 계산에 영향을 주는 상태 변경 시 같은 트랜잭션에서 증가시킨다. 입력 스냅샷도 이 버전과 데이터가 일치하도록 읽는다. 실시간 체험 시계의 단순 초 단위 진행은 버전을 올리지 않는다. 근무 시작/종료·로트 만료 경계를 지난 제안은 만료시키며 승인 시 기존 주문의 이행 가능성을 재계산한다. 수동 시각 변경은 운영 버전을 올린다.
 
 이 단순 방식은 주문이 계속 들어오면 재승인이 반복될 수 있다. 실운영 확장 시 설정·인력 버전과 대기열 버전을 분리하고, 승인 직전 빠른 재검증으로 개선한다. 데모에서는 주문 유입을 통제해 정상 승인과 상태 충돌 사례를 각각 시연한다.
 
@@ -763,7 +763,7 @@ shiftpatch/
 
 ### 12.1 실행 구성
 
-Firebase Hosting에서 웹을 제공하고 `/api/**` 요청을 Cloud Run으로 연결한다. API rewrite를 SPA 화면 fallback보다 먼저 적용한다. Hosting 경유 요청은 공식 문서상 60초 제한이 있으므로, 제안 생성은 전체 40초를 초기 상한으로 두고 모델·도구 호출에 남은 시간을 전달한다. 이는 구현 목표이며 응답 시간 보장은 아니다. [Hosting과 Cloud Run 연결](https://firebase.google.com/docs/hosting/cloud-run)
+Cloud Run의 FastAPI 서비스에서 React 빌드 파일과 `/api/**`를 함께 제공한다. 미등록 API는 SPA 화면으로 처리하지 않고 404를 반환한다. 제안 생성은 전체 39초 제한 안에서 모델·도구 호출을 수행한다. Dockerfile과 `scripts/deploy.py`는 구현했으며 실제 클라우드 배포는 프로젝트 설정 후 확인한다.
 
 응답 전에 완료하지 못한 AI 작업은 중단·실패 상태로 처리한다. 완료가 필요한 작업을 응답 후 서버 메모리의 백그라운드 태스크에 맡기지 않는다. 장기 작업이 필요해지면 Cloud Tasks와 작업 상태 조회 구조를 도입한다. [Cloud Run 실행 계약](https://docs.cloud.google.com/run/docs/container-contract)
 
@@ -771,8 +771,8 @@ Firebase Hosting에서 웹을 제공하고 `/api/**` 요청을 Cloud Run으로 �
 
 ### 12.2 접근 권한
 
-- 프론트엔드는 Firebase ID 토큰을 전달하고, FastAPI가 토큰과 `members`의 매장·역할을 검사한다.
-- Cloud Run 호출 경로와 Firebase 사용자 인증을 구분한다. Hosting에서 접근 가능한 API라도 업무 요청은 서버 인증을 통과해야 한다.
+- 게스트는 서버의 개인 샘플 세션을 발급받는다. Google 로그인은 Firebase ID 토큰을 서버에서 검증한 뒤 HttpOnly 세션으로 교환한다. 모든 운영 요청은 세션에 연결된 매장 소유권을 검사한다.
+- Cloud Run 공개 접속과 운영 권한을 구분한다. API에 접근할 수 있어도 다른 사용자의 샘플은 조작할 수 없다. 변경 요청은 허용 Origin을 검사한다.
 - Cloud Run은 전용 서비스 계정과 Application Default Credentials로 Google Cloud API를 호출한다. 서비스 계정 키 파일을 웹이나 저장소에 포함하지 않는다.
 - 서버의 Firestore 접근은 서비스 계정 IAM으로 제한하고, 브라우저의 직접 읽기·쓰기는 차단한다.
 - Firestore 서버 SDK는 Security Rules를 우회하므로 매장·역할 검증은 FastAPI에서 수행한다.
