@@ -4546,3 +4546,26 @@ tbody tr:hover {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+.ai-entry-bar { display:flex; align-items:center; flex-wrap:wrap; gap:16px; padding:18px 22px; margin:0 0 20px; background:#fff; border:1px solid #d9e1ec; border-left:4px solid #183553; border-radius:8px; }
+.ai-entry-bar > div { flex:1; min-width:200px; }
+.ai-entry-bar strong { display:flex; align-items:center; gap:8px; color:#183553; }
+.ai-entry-bar p { margin:7px 0 0; font-size:12px; line-height:1.6; color:#526277; }
+.agent-auto { display:flex; align-items:center; gap:7px; font-size:12px; }
+.agent-progress { margin-bottom:20px; padding:20px; border:1px solid #bfd2e8; background:#f5f8fd; border-radius:8px; }
+.agent-progress-heading { display:flex; align-items:center; flex-wrap:wrap; gap:10px; color:#183553; }
+.agent-progress-heading span { font-size:12px; flex:1; }
+.agent-progress > p { font-size:12px; color:#526277; }
+.agent-progress ol { list-style:none; padding:0; margin:12px 0 0; }
+.agent-progress li { display:flex; align-items:center; gap:8px; padding:7px 0; font-size:12px; }
+.agent-progress li span { color:#526277; margin-left:auto; }
+.agent-questions { margin:20px 0; padding:20px; background:#f5f8fd; border:1px solid #d9e1ec; border-radius:8px; }
+.agent-questions h3 { display:flex; align-items:center; gap:8px; margin:0 0 18px; }
+.agent-questions .form-label { margin-bottom:18px; }
+.agent-questions .button { align-self:flex-start; }
+.candidate-explanation,.candidate-tradeoff { padding:0 18px; font-size:12px; line-height:1.7; }
+.candidate-tradeoff { color:#526277; }
+.candidate-evidence { padding:0 18px; font-size:11px; color:#526277; overflow-wrap:anywhere; }
+.lot-details { margin-top:6px; font-size:11px; white-space:normal; min-width:170px; }
+.lot-details p { margin:7px 0; color:#526277; }
+@media(max-width:650px) { .ai-entry-bar { padding:16px; } .ai-entry-bar > div { flex-basis:100%; } .ai-entry-bar .button { width:100%; justify-content:center; } }

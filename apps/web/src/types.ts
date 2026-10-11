@@ -52,6 +52,7 @@ export interface Ingredient {
   reserved: number;
   expires_at: string;
   buffer: number;
+  lots?: { id: string; quantity: number; reserved: number; expires_at: string; received_at: string }[];
 }
 
 export interface Delivery {
@@ -95,6 +96,7 @@ export interface Candidate {
   action: "keep_current" | "replace_limits";
   limits: Record<string, number>;
   review_after_minutes: number;
+  valid_until?: string;
   metrics: {
     completed_units: number;
     completed_orders: number;
@@ -106,6 +108,11 @@ export interface Candidate {
   };
   feasible: boolean;
   notes: string[];
+  explanation?: string;
+  tradeoff?: string;
+  parent_candidate_id?: string;
+  based_on_result_ids?: string[];
+  evidence_refs?: string[];
 }
 
 export interface Prep {
@@ -123,6 +130,7 @@ export interface Prep {
     to_order: number;
   }[];
   notes: string[];
+  windows?: { start_at: string; end_at: string; counts: Record<string, number> }[];
 }
 
 export interface Proposal {
@@ -130,7 +138,7 @@ export interface Proposal {
   mode: ProposalMode;
   type: "prep_plan" | "service_plan" | "next_day_plan";
   status:
-    "ready" | "stale" | "applied" | "acknowledged" | "failed" | "waiting_input";
+    "ready" | "stale" | "applied" | "acknowledged" | "failed" | "waiting_input" | "dismissed";
   revision: number;
   source: "gemini" | "calculation_only";
   created_at: string;
@@ -146,10 +154,33 @@ export interface Proposal {
     result_summary: unknown;
   }[];
   prep?: Prep;
-  questions?: string[];
+  run_id?: string;
+  parent_run_id?: string | null;
+  model_id?: string;
+  model_calls?: number;
+  elapsed_ms?: number;
+  questions?: (AgentQuestion | string)[];
   error?: string;
 }
 
+export interface AgentQuestion {
+  id: string;
+  text: string;
+  field: "staff" | "next_day_staff" | "inventory" | "history" | "close" | "objective" | "allow_menu_pause" | "review_after_minutes";
+  options: string[];
+}
+export interface GenerateOptions {
+  trigger_event_id?: string;
+  parent_run_id?: string;
+  answers?: Record<string, string>;
+}
+export interface AgentRun {
+  id: string;
+  status: string;
+  phase: "snapshot" | "investigate" | "calculate" | "explain" | "validate";
+  trace: Proposal["trace"];
+  cancel_requested?: boolean;
+}
 export interface CloseRecord {
   id: string;
   service_date?: string;
@@ -172,6 +203,7 @@ export interface CloseRecord {
 export interface Overview {
   store: { id: string; name: string; service_date: string };
   business_now: string;
+  clock?: { mode: "manual" | "realtime" };
   revision: number;
   staff: Staff[];
   next_day_staff?: Staff[];
@@ -194,7 +226,11 @@ export interface Overview {
     date: string;
     counts: Record<string, number>;
     restricted: boolean;
+    windows?: { start_time: string; counts: Record<string, number> }[];
   }[];
+  replan_required?: boolean;
+  replan_event?: { id: string; message: string } | null;
+  active_run?: AgentRun | null;
   metrics: {
     completed_orders: number;
     revenue: number;

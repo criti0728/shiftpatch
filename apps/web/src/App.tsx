@@ -38,8 +38,11 @@ import {
 } from "lucide-react";
 import { ApiError, request } from "./api";
 import SessionGate from "./SessionGate";
+import { AgentProgress, AgentQuestions } from "./AgentPanel";
 import type {
   AuthenticatedSession,
+  AgentQuestion,
+  GenerateOptions,
   Candidate,
   Objective,
   Overview,
@@ -222,12 +225,15 @@ function Workspace({
   const [objective, setObjective] = useState<Objective>("balanced");
   const [activeProposal, setActiveProposal] = useState<Proposal | null>(null);
   const [generating, setGenerating] = useState(false);
+  const [autoAnalyze, setAutoAnalyze] = useState(true);
+  const autoSeen = useRef(new Set<string>());
   const { data, error, isPending, refetch } = useQuery({
     queryKey: ["overview", session.store.id],
     queryFn: ({ signal }) =>
       request<Overview>("/overview", "GET", undefined, signal),
-    refetchInterval: 4000,
+    refetchInterval: generating ? 1000 : 4000,
   });
+  const waitingProposal = data?.proposals.find(p => p.status === 'waiting_input' && !data.proposals.some(child => child.parent_run_id === p.run_id));
   const demo = window.location.pathname.startsWith("/demo/order");
   useEffect(() => {
     if (
@@ -281,11 +287,20 @@ function Workspace({
     const timer = window.setTimeout(() => setNotice(null), 5500);
     return () => window.clearTimeout(timer);
   }, [notice]);
-  async function generate(mode: ProposalMode) {
+  useEffect(() => {
+    if (demo || !autoAnalyze || busy || sessionBusy || generating || waitingProposal || !data?.replan_required || !data.replan_event || data.active_run?.status === 'running') return;
+    const id = data.replan_event.id;
+    if (autoSeen.current.has(id)) return;
+    autoSeen.current.add(id);
+    void generate('in_service', { trigger_event_id: id });
+  }, [data, autoAnalyze, busy, sessionBusy, generating, demo, waitingProposal]);
+  async function generate(mode: ProposalMode, options: GenerateOptions = {}) {
+    if (busy || sessionBusy || generating) return;
     setGenerating(true);
     const result = await act<Proposal>("/proposals", "POST", {
       mode,
       objective,
+      ...options,
     });
     if (result) setActiveProposal(result);
     setGenerating(false);
@@ -505,24 +520,25 @@ function Workspace({
               </div>
             </div>
             <div className="clock-card">
-              <span>体験用の営業時刻</span>
+              <span>{data.clock?.mode === 'realtime' ? '体験時計 · 実時間で進行' : '体験用の営業時刻'}</span>
               <strong>
                 {time(data.business_now)}
                 <small>JST</small>
               </strong>
               <div>
                 <button
-                  disabled={!!busy || sessionBusy}
+                  disabled={!!busy || sessionBusy || data.clock?.mode === "realtime"}
                   onClick={() => act("/demo/advance", "POST", { minutes: 5 })}
                 >
                   +5分
                 </button>
                 <button
-                  disabled={!!busy || sessionBusy}
+                  disabled={!!busy || sessionBusy || data.clock?.mode === "realtime"}
                   onClick={() => act("/demo/advance", "POST", { minutes: 15 })}
                 >
                   +15分
                 </button>
+                <button disabled={!!busy || sessionBusy} onClick={() => act('/clock', 'POST', { mode: data.clock?.mode === 'realtime' ? 'manual' : 'realtime' })}>{data.clock?.mode === 'realtime' ? '一時停止' : '実時間で進める'}</button>
                 <button
                   title="サンプル店舗をリセット"
                   aria-label="サンプル店舗をリセット"
@@ -551,6 +567,16 @@ function Workspace({
             </span>
             <Badge>自分専用のデータ</Badge>
           </div>
+          {!demo && <section className="ai-entry-bar">
+            <div><strong><Sparkles size={16}/> {data.config.agent_mode === 'gemini' ? 'AI運営アシスタント' : '運営アシスタント · 計算モード'}</strong><p>{data.replan_event?.message || '今日の勤務・在庫・注文を調べ、運営候補を比較します。'}</p></div>
+            <label className="agent-auto"><input type="checkbox" checked={autoAnalyze} onChange={e => setAutoAnalyze(e.target.checked)}/> 事件発生時に自動分析</label>
+            <GenerateButton {...props} mode={screen === 'prep' ? 'pre_open' : screen === 'close' ? 'post_close' : 'in_service'}>{data.config.agent_mode === 'gemini' ? 'AIで分析する' : '条件を計算する'}</GenerateButton>
+          </section>}
+          {!demo && waitingProposal && !generating && <div className="alert"><CircleHelp size={17}/><span>分析に確認事項があります。運営データを修正した後、回答して続けられます。</span><button className="text-button" onClick={() => setActiveProposal(waitingProposal)}>確認・回答する</button></div>}
+          {!demo && data.active_run?.status === 'running' && <AgentProgress run={data.active_run} onCancel={async () => {
+            try { await request(`/agent-runs/${data.active_run!.id}/cancel`, 'POST', {}); await refetch(); }
+            catch (e) { setNotice({ text: e instanceof Error ? e.message : '中断に失敗しました。', error: true }); }
+          }}/>}
           {error && (
             <div className="alert warning">
               <AlertTriangle size={16} />
@@ -602,6 +628,7 @@ function Workspace({
       )}
       {activeProposal && (
         <ProposalModal
+          key={activeProposal.id}
           proposal={
             data.proposals.find((p) => p.id === activeProposal.id) ||
             activeProposal
@@ -610,6 +637,8 @@ function Workspace({
           act={act}
           busy={!!busy || sessionBusy}
           onClose={() => setActiveProposal(null)}
+          onContinue={async answers => { const p = activeProposal; if (p?.run_id) { setActiveProposal(null); await generate(p.mode, { parent_run_id: p.run_id, answers }); } }}
+          onEdit={field => { setActiveProposal(null); setScreen(field === 'inventory' ? 'prep' : field === 'close' || field === 'history' ? 'close' : 'shifts'); window.scrollTo({ top: 0 }); }}
         />
       )}
       {resetOpen && (
@@ -654,7 +683,7 @@ type CommonProps = {
   data: Overview;
   act: Action;
   busy: boolean;
-  generate: (mode: ProposalMode) => Promise<void>;
+  generate: (mode: ProposalMode, options?: GenerateOptions) => Promise<void>;
   generating: boolean;
   objective: Objective;
   setObjective: (objective: Objective) => void;
@@ -915,7 +944,7 @@ function Service(
                   <Sparkles size={20} />
                 </span>
                 <div>
-                  <h2>運営プラン</h2>
+                  <h2>AI運営アシスタント</h2>
                   <p>人員・在庫・注文をもとに30分先を比較</p>
                 </div>
               </div>
@@ -1176,6 +1205,7 @@ function TaskRow({
       </div>
       {task.status === "accepted" ? (
         <div className="task-actions">
+          {Object.keys(task.allocations).some(id => { const entry = data.inventory.find(v => v.id === id); return entry && (entry.on_hand < entry.reserved || new Date(entry.expires_at) <= new Date(data.business_now)); }) && <button className="button small" disabled={busy} aria-label={`${taskLabel}の材料を再確保`} onClick={() => act(`/orders/${orderId}/tasks/${task.id}/reallocate`, 'POST', {}, '有効な材料を再確保しました。')}>材料を再確保</button>}
           <select
             aria-label={`${taskLabel}の担当スタッフ`}
             value={selected}
@@ -1536,7 +1566,9 @@ function Preparation(
     name: string;
     unit: string;
     value: number;
+    expires_at: string;
   } | null>(null);
+  const [newLot, setNewLot] = useState<{ingredient_id: string; quantity: number; expires_at: string} | null>(null);
   const latest = data.proposals.find((p) => p.mode === "pre_open");
   return (
     <>
@@ -1568,7 +1600,7 @@ function Preparation(
               <h2>原材料在庫</h2>
               <p>実在庫から受付済み注文の予約分を除いた数量が利用可能です。</p>
             </div>
-            <Badge>{data.inventory.length}品目</Badge>
+            <button className="button" disabled={busy} onClick={() => setNewLot({ ingredient_id: data.inventory[0].id, quantity: 1, expires_at: new Date(new Date(data.inventory[0].expires_at).getTime()+9*3600000).toISOString().slice(0,16) })}><Plus size={14}/>ロット追加</button>
           </div>
           <div className="table-scroll">
             <table>
@@ -1583,12 +1615,13 @@ function Preparation(
               </thead>
               <tbody>
                 {data.inventory.map((item) => {
-                  const usable = item.on_hand - item.reserved;
+                  const usable = item.lots?.reduce((n, l) => n + (new Date(l.expires_at) > new Date(data.business_now) ? Math.max(0, l.quantity-l.reserved) : 0), 0) ?? Math.max(0, item.on_hand - item.reserved);
                   return (
                     <tr key={item.id}>
                       <td>
                         <strong>{item.name}</strong>
-                        <small>期限 {date(item.expires_at)}</small>
+                        <small>最短期限 {date(item.expires_at)}</small>
+                        <details className="lot-details"><summary>{item.lots?.length || 1}ロットを確認</summary>{item.lots?.map(l => <p key={l.id}>{date(l.expires_at)} {time(l.expires_at)} · {l.quantity}{item.unit} / 予約 {l.reserved}{item.unit}{new Date(l.expires_at) <= new Date(data.business_now) ? ' · 期限切れ' : ''}</p>)}</details>
                       </td>
                       <td className="numeric">
                         {number(item.on_hand)}
@@ -1682,6 +1715,7 @@ function Preparation(
                           name: ingredient?.name || delivery.ingredient_id,
                           unit: ingredient?.unit || "",
                           value: delivery.quantity,
+                          expires_at: new Date(new Date(ingredient?.expires_at || data.business_now).getTime()+9*3600000).toISOString().slice(0,16),
                         })
                       }
                     >
@@ -1721,6 +1755,13 @@ function Preparation(
           ))}
         </div>
       </Panel>
+      {newLot && <Modal title="材料ロットを追加" onClose={() => setNewLot(null)}><form onSubmit={async e => { e.preventDefault(); if (await act('/inventory-lots', 'POST', { ...newLot, expires_at: new Date(newLot.expires_at+'+09:00').toISOString() })) setNewLot(null); }}>
+        <p className="field-help">入荷した順に、提供予定時刻まで有効なロットから材料を予約します。有効期限は日本時間で入力します。</p>
+        <label className="form-label">材料<select value={newLot.ingredient_id} onChange={e => setNewLot({ ...newLot, ingredient_id: e.target.value })}>{data.inventory.map(v => <option key={v.id} value={v.id}>{v.name} ({v.unit})</option>)}</select></label>
+        <label className="form-label">数量<input required type="number" min="1" max="1000000" step="1" value={newLot.quantity} onChange={e => setNewLot({ ...newLot, quantity: Number(e.target.value) })}/></label>
+        <label className="form-label">有効期限（JST）<input required type="datetime-local" value={newLot.expires_at} onChange={e => setNewLot({ ...newLot, expires_at: e.target.value })}/></label>
+        <div className="modal-actions"><button className="button primary" disabled={busy}>ロットを保存</button></div>
+      </form></Modal>}
       {adjust && (
         <Modal
           title={`${adjust.name}の在庫調整`}
@@ -1743,7 +1784,7 @@ function Preparation(
             <p className="modal-description">
               棚卸しで確認した実際の数量を入力してください。予約済みの{" "}
               {adjust.reserved}
-              {adjust.unit} は確保されます。
+              {adjust.unit} を下回る場合は不足警告となり、影響する作業を開始できません。
             </p>
             <label className="form-label">
               実在庫（{adjust.unit}）
@@ -1751,7 +1792,7 @@ function Preparation(
                 autoFocus
                 required
                 type="number"
-                min={adjust.reserved}
+                min={0}
                 step="1"
                 value={adjust.value}
                 onChange={(e) =>
@@ -1786,7 +1827,7 @@ function Preparation(
                 await act(
                   `/deliveries/${receive.id}/receive`,
                   "POST",
-                  { quantity: receive.value },
+                  { quantity: receive.value, expires_at: new Date(receive.expires_at+"+09:00").toISOString() },
                   "検品した数量を在庫に反映しました。",
                 )
               )
@@ -1810,6 +1851,7 @@ function Preparation(
                 }
               />
             </label>
+            <label className="form-label">入荷したロットの有効期限（JST）<input required type="datetime-local" value={receive.expires_at} onChange={e => setReceive({ ...receive, expires_at: e.target.value })}/></label>
             <div className="modal-actions">
               <button
                 type="button"
@@ -2096,6 +2138,7 @@ function ClosePage(
                   {
                     counts: historyEdit.counts,
                     restricted: historyEdit.restricted,
+                    windows: historyEdit.windows,
                   },
                   "販売記録を更新しました。",
                 )
@@ -2114,6 +2157,7 @@ function ClosePage(
                     min="0"
                     max="10000"
                     step="1"
+                    disabled={Boolean(historyEdit.windows)}
                     value={historyEdit.counts[menu.id] || 0}
                     onChange={(e) =>
                       setHistoryEdit({
@@ -2129,6 +2173,15 @@ function ClosePage(
                 </div>
               </label>
             ))}
+            <label className="check-field"><input type="checkbox" checked={Boolean(historyEdit.windows)} onChange={e => {
+              if (!e.target.checked) { setHistoryEdit({ ...historyEdit, windows: undefined }); return; }
+              const windows = ['11:00','11:30','12:00','12:30'].map((start_time, index) => ({ start_time, counts: Object.fromEntries(data.menus.map(m => [m.id, Math.floor((historyEdit.counts[m.id] || 0)/4) + (index < (historyEdit.counts[m.id] || 0)%4 ? 1 : 0)])) }));
+              setHistoryEdit({ ...historyEdit, windows });
+            }}/>時間帯別の販売も記録する</label>
+            {historyEdit.windows && <><p className="field-help">各時間帯を編集すると日別合計も更新します。初期配分は均等な入力補助です。実績に合わせて変更してください。</p><div className="table-scroll"><table><thead><tr><th>時間帯</th>{data.menus.map(m => <th key={m.id}>{m.name}</th>)}</tr></thead><tbody>{historyEdit.windows.map((w, i) => <tr key={w.start_time}><td>{w.start_time}</td>{data.menus.map(m => <td key={m.id}><input aria-label={`${w.start_time} ${m.name}の販売数`} required type="number" min="0" max="1000" step="1" value={w.counts[m.id] || 0} onChange={e => {
+              const windows = historyEdit.windows!.map((row, j) => j === i ? { ...row, counts: { ...row.counts, [m.id]: Number(e.target.value) } } : row);
+              setHistoryEdit({ ...historyEdit, windows, counts: { ...historyEdit.counts, [m.id]: windows.reduce((sum, row) => sum+row.counts[m.id], 0) } });
+            }}/></td>)}</tr>)}</tbody></table></div></>}
             <label className="check-field">
               <input
                 type="checkbox"
@@ -2171,6 +2224,7 @@ function statusLabel(status: string) {
         acknowledged: "確認済み",
         failed: "生成失敗",
         waiting_input: "情報の確認が必要",
+        dismissed: "見送り済み",
       } as Record<string, string>
     )[status] || status
   );
@@ -2181,12 +2235,16 @@ function ProposalModal({
   act,
   busy,
   onClose,
+  onContinue,
+  onEdit,
 }: {
   proposal: Proposal;
   data: Overview;
   act: Action;
   busy: boolean;
   onClose: () => void;
+  onContinue: (answers: Record<string, string>) => Promise<void>;
+  onEdit: (field: string) => void;
 }) {
   const [selected, setSelected] = useState(
     proposal.recommended_candidate_id ||
@@ -2228,12 +2286,9 @@ function ProposalModal({
         </div>
       )}
       {proposal.error && <div className="alert warning">{proposal.error}</div>}
-      {proposal.questions?.map((question) => (
-        <div className="alert" key={question}>
-          <CircleHelp size={17} />
-          {question}
-        </div>
-      ))}
+      {proposal.questions?.filter((q): q is string => typeof q === 'string').map(question => <div className="alert" key={question}>{question}</div>)}
+      {proposal.status === 'waiting_input' && proposal.questions?.some(q => typeof q !== 'string') && <AgentQuestions key={proposal.id} questions={proposal.questions.filter((q): q is AgentQuestion => typeof q !== 'string')} busy={busy} onContinue={onContinue} onEdit={onEdit}/>}
+      <p className="field-help">{proposal.model_id ? `モデル: ${proposal.model_id} · ` : ''}{proposal.model_calls ?? 0} 回のモデル呼出し · {((proposal.elapsed_ms ?? 0)/1000).toFixed(1)}秒{proposal.parent_run_id ? ' · 前の確認回答から続行' : ''}</p>
       {proposal.candidates.length > 0 && (
         <>
           <div className="comparison-label">
@@ -2354,10 +2409,11 @@ function ProposalModal({
         <button className="button" onClick={onClose}>
           閉じる
         </button>
+        {!['applied', 'acknowledged', 'dismissed'].includes(proposal.status) && <button className="button" disabled={busy} onClick={async () => { if (await act(`/proposals/${proposal.id}/dismiss`, 'POST', {})) onClose(); }}>この提案を見送る</button>}
         {canApply && (
           <button
             className="button primary"
-            disabled={busy || stale || !candidate?.feasible}
+            disabled={busy || stale || !candidate?.feasible || Boolean(candidate?.valid_until && new Date(candidate.valid_until) <= new Date(data.business_now))}
             onClick={async () => {
               if (
                 await act(
@@ -2472,8 +2528,12 @@ function CandidateCard({
         ) : (
           <span>販売制限を解除</span>
         )}
-        <small>{c.review_after_minutes}分後に見直し</small>
+        <small>{c.valid_until ? `${time(c.valid_until)} まで有効` : `${c.review_after_minutes}分後に見直し`}</small>
       </div>
+      {c.explanation && <p className="candidate-explanation">{c.explanation}</p>}
+      {c.tradeoff && <p className="candidate-tradeoff"><strong>トレードオフ</strong> {c.tradeoff}</p>}
+      {c.parent_candidate_id && <p className="field-help">{c.parent_candidate_id} の計算結果を見て修正した候補</p>}
+      {c.evidence_refs?.length ? <details className="candidate-evidence"><summary>根拠の結果ID</summary><p>{c.evidence_refs.join(' · ')}</p></details> : null}
       <ul className="notes">
         {c.notes.map((note, i) => (
           <li key={i}>{note}</li>
