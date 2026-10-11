@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run both local development servers; Ctrl+C stops both process groups."""
 from pathlib import Path
+import json
 import os
 import shlex
 import shutil
@@ -8,8 +9,30 @@ import signal
 import subprocess
 import sys
 import time
+from urllib.request import urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def web_dependencies_ready():
+    web = ROOT / "apps/web"
+    packages = json.loads((web / "package.json").read_text())
+    required = list(packages["dependencies"]) + ["vite", "typescript"]
+    return all((web / "node_modules" / name / "package.json").is_file() for name in required) and all(
+        (web / "node_modules" / path).is_file()
+        for path in ["vite/bin/vite.js", "typescript/bin/tsc"]
+    )
+
+
+def servers_ready():
+    try:
+        with urlopen("http://127.0.0.1:8000/api/health", timeout=0.5) as response:
+            if json.load(response).get("status") != "ok":
+                return False
+        with urlopen("http://127.0.0.1:5173/", timeout=0.5) as response:
+            return response.status == 200
+    except (OSError, ValueError):
+        return False
 
 
 def load_env():
@@ -33,8 +56,10 @@ def load_env():
 def main():
     python = ROOT / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     npm = shutil.which("npm")
-    if not python.exists() or not (ROOT / "apps/web/node_modules").exists() or not npm:
+    if not python.exists() or not npm:
         sys.exit("먼저 README의 설치 명령을 실행해 주세요. (.venv, npm, node_modules 필요)")
+    if not web_dependencies_ready():
+        sys.exit("프런트엔드 패키지 설치가 완료되지 않았습니다. npm ci --prefix apps/web 가 성공한 뒤 다시 실행해 주세요.")
     load_env()
     os.environ.setdefault("SHIFTPATCH_AI_MODE", "calculation_only")
     processes = []
@@ -49,7 +74,17 @@ def main():
             [npm, "--prefix", "apps/web", "run", "dev", "--", "--port", "5173", "--strictPort"],
         ]:
             processes.append(subprocess.Popen(command, cwd=ROOT, start_new_session=os.name != "nt"))
-        print("\nShiftPatch: http://127.0.0.1:5173  |  API: http://127.0.0.1:8000/docs", flush=True)
+        deadline = time.monotonic() + 20
+        while all(process.poll() is None for process in processes):
+            if servers_ready():
+                break
+            if time.monotonic() >= deadline:
+                print("서버 시작을 확인하지 못했습니다. 위 오류와 포트 8000·5173 상태를 확인해 주세요.", flush=True)
+                return 1
+            time.sleep(0.2)
+        else:
+            return next(process.returncode for process in processes if process.poll() is not None) or 1
+        print("\nShiftPatch 실행 준비 완료: http://127.0.0.1:5173  |  API: http://127.0.0.1:8000/docs", flush=True)
         print(f"AI mode: {os.environ['SHIFTPATCH_AI_MODE']}  |  Ctrl+C to stop\n", flush=True)
         while all(process.poll() is None for process in processes):
             time.sleep(0.3)
@@ -59,6 +94,8 @@ def main():
         return 0
     finally:
         for process in processes:
+            if process.poll() is not None:
+                continue
             try:
                 if os.name == "nt":
                     process.terminate()
