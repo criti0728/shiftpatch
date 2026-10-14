@@ -93,7 +93,7 @@ npm ci --prefix apps/web
 
 ### 서버를 개별 실행하는 경우
 
-두 서버를 따로 실행하려면 다음 명령을 각각 별도 터미널에서 실행합니다. 개별 실행 시 `.env`는 자동으로 읽지 않으므로 필요한 환경 변수는 직접 설정해야 합니다.
+두 서버를 따로 실행하려면 다음 명령을 각각 별도 터미널에서 실행합니다. API 서버도 프로젝트 루트의 `.env`를 읽으며, 이미 설정된 환경 변수가 우선합니다.
 
 ```bash
 .venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
@@ -138,32 +138,36 @@ Gemini 경로에서는 모델이 필요한 조회를 선택하고, 판매량 제
 
 ## Gemini 연결과 실제 검증
 
-프로젝트가 없어도 **Gemini Developer API 키 + 모델 ID**로 로컬에서 검증할 수 있습니다. API 주소만으로는 인증할 수 없으므로 키 또는 Cloud ADC 인증이 필요합니다. 기존 `.env`가 있으면 해당 항목만 편집하고, 없으면 `.env.example`을 복사합니다.
-
-```dotenv
-SHIFTPATCH_AI_MODE=gemini
-SHIFTPATCH_GEMINI_PROVIDER=developer
-GEMINI_API_KEY=your-api-key
-SHIFTPATCH_GEMINI_MODEL=your-supported-model-id
-```
-
-공식 API는 주소를 생략하면 됩니다. 별도 Gemini 네이티브 API 프록시가 있다면 `SHIFTPATCH_GEMINI_ENDPOINT=https://your-gateway.example.com`과 필요 시 `SHIFTPATCH_GEMINI_API_VERSION=v1beta`를 추가합니다. `:generateContent`가 붙은 모델 전체 URL이나 OpenAI 호환 URL은 이 설정에 넣지 않습니다. 서버가 API 버전·모델 경로를 붙입니다. [Google Gen AI SDK 연결 설정](https://googleapis.github.io/python-genai/)
-
-Cloud 플랫폼 경유는 기존 ADC 방식을 사용합니다.
-
-```bash
-gcloud auth application-default login
-```
+GCP 크레딧을 연결한 프로젝트는 **Vertex AI + ADC 인증**으로 사용합니다. 프로젝트 루트의 `.env`에 아래 항목을 넣습니다. `.env`는 Git에서 제외되며 모델 호출은 서버에서만 수행합니다. 기존 파일이 있으면 필요한 항목만 편집하고, 없으면 `.env.example`을 복사합니다.
 
 ```dotenv
 SHIFTPATCH_AI_MODE=gemini
 SHIFTPATCH_GEMINI_PROVIDER=vertex
 GOOGLE_CLOUD_PROJECT=your-project-id
 GOOGLE_CLOUD_LOCATION=global
-SHIFTPATCH_GEMINI_MODEL=your-supported-model-id
+SHIFTPATCH_GEMINI_MODEL=gemini-3.8-flash
+SHIFTPATCH_AI_TIMEOUT_SECONDS=120
 ```
 
-설정 후 개발 서버를 Ctrl+C로 멈추고 `python3 scripts/dev.py`로 다시 시작합니다. 화면 상단 **AI運営アシスタント → AIで分析する**가 진입점입니다. 사건 자동 분석을 켜 두면 결원·실재고 변경·입고 차이·주문/대기 임계값·재검토 시각에 재분석합니다. 자동 요청은 점장 화면이 열려 있는 동안 동작합니다. 조사·계산·설명·검증 진행과 실제 도구 목록을 표시하고, 질문에 답해 새 스냅샷으로 이어서 실행할 수 있습니다.
+로컬에서는 프로젝트에 접근 가능한 계정으로 인증합니다. Vertex AI API 활성화와 `roles/aiplatform.user` 권한이 필요합니다. [Google Cloud 연결 안내](https://cloud.google.com/vertex-ai/generative-ai/docs/start/quickstart)
+
+```bash
+gcloud auth application-default login
+python3 scripts/check_gemini.py
+```
+
+```dotenv
+SHIFTPATCH_AI_MODE=gemini
+SHIFTPATCH_GEMINI_PROVIDER=developer
+GEMINI_API_KEY=your-api-key
+SHIFTPATCH_GEMINI_MODEL=gemini-3.8-flash
+```
+
+위 두 번째 설정은 별도로 **Developer API 키**를 사용하는 경우입니다. `check_gemini.py`와 앱은 같은 `.env`의 provider·모델·인증 설정을 사용합니다. 연결 스크립트는 프로젝트 `.venv`에서 자동 실행됩니다. `auto` 선택은 프로젝트가 있으면 Vertex를 우선하므로 키를 쓰려면 `developer`를 명시합니다. 공식 API는 endpoint를 생략합니다. 네이티브 프록시는 `SHIFTPATCH_GEMINI_ENDPOINT`에 베이스 URL을 넣으며 OpenAI 호환 URL과 모델 전체 URL은 허용하지 않습니다. [SDK 설정](https://googleapis.github.io/python-genai/)
+
+분석 시간은 `SHIFTPATCH_AI_TIMEOUT_SECONDS`로 10~180초 안에서 설정합니다. 생략 시 40초이며 다단계 실제 모델 분석에는 120초를 권장합니다. API의 실행 만료·모델 대기·결과 저장이 같은 예산을 사용합니다. 시간 제한을 늘려도 모델 호출 6회·도구 실행 12회·후보 5개 상한은 유지합니다.
+
+설정 후 개발 서버를 Ctrl+C로 멈추고 `python3 scripts/dev.py`로 다시 시작합니다. 화면 상단 **AI運営アシスタント → AIで分析する**가 진입점입니다. 영업 전·영업 중·마감 후에 맞는 모드로 분석하며, 사건 자동 분석을 켜면 영업 중 결원·실재고 변경·입고 차이·주문/대기 임계값·재검토 시각에 재분석합니다. 자동 요청은 점장 화면이 열려 있는 동안 동작합니다. 조사·계산·설명·검증 진행과 실제 도구 목록을 표시합니다. 질문에 답하거나 운영 데이터를 저장한 뒤 새 스냅샷으로 이어서 실행하고, 검증된 후보는 점장 승인 후 반영합니다. 이어가기 실패 시 입력 답변을 유지하며 실패·만료 결과에서는 새로 분석할 수 있습니다.
 
 실제 모델 검증 명령은 개발 서버와 별도로 실행합니다. 운영 DB에 접근하지 않고 매번 새 합성 매장을 사용합니다.
 
@@ -176,7 +180,7 @@ SHIFTPATCH_GEMINI_MODEL=your-supported-model-id
 
 `test-results/gemini-live/summary.json`과 시나리오별 JSON에 실제 모델 ID·도구 인자·결과 ID·부모/수정 후보·지연·토큰 사용량을 기록합니다. 인증 정보와 모델 내부 사고는 저장하지 않습니다. 전체 명령은 최대 6개의 독립 분석을 실제 호출합니다. 모든 결과 계약, 사건에 맞는 조회, 서로 다른 조사 경로, **선행 계산 결과를 참조한 실제 후보 수정**을 확인해야 종료 코드 0입니다. 모델이 수정하지 않거나 시간/호출 예산을 넘기면 미통과로 기록하며 구현 성공과 혼동하지 않습니다. `--rounds 3`으로 반복 평가할 수 있습니다.
 
-스크립트는 `.env`를 읽고 항상 Gemini 모드로 실행합니다. 설정 실패는 종료 코드 2, 실제 실행/행동 검증 미통과는 1입니다. 직접 uvicorn을 실행하는 경우 환경 변수를 따로 설정해야 합니다. 키는 서버 `.env`에만 저장하며 브라우저나 저장소에 넣지 않습니다. 자세한 판정과 범위는 [실호출 검증 안내](docs/GEMINI_VALIDATION.md)를 참고하세요.
+연결 확인·에이전트 검증·개발 서버·직접 uvicorn 실행 모두 `.env`를 읽습니다. 기존 프로세스 환경 변수가 파일보다 우선합니다. 에이전트 검증의 설정 실패는 종료 코드 2, 실제 실행/행동 검증 미통과는 1입니다. 키는 서버 `.env`에만 저장하며 브라우저나 저장소에 넣지 않습니다. 자세한 판정과 범위는 [실호출 검증 안내](docs/GEMINI_VALIDATION.md)를 참고하세요.
 
 ## 검증
 
@@ -218,6 +222,6 @@ ARCHITECTURE.md           목표 아키텍처와 해커톤 설계
 
 게스트 세션·사용자별 샘플·선택적 Firebase Google 로그인·Firestore 어댑터·Cloud Run 컨테이너와 배포 스크립트를 구현했습니다. 웹/API는 Cloud Run 한 서비스에서 제공합니다. 로컬은 SQLite를 사용하고 실제 공개 실행은 Firestore와 허용 Origin 설정을 요구합니다. API에서 세션 소유권을 검사하며 브라우저의 Firestore 직접 접근은 deny-all 규칙으로 막습니다.
 
-프로젝트가 없어 실제 Google 로그인·원격 Firestore·Gemini 호출·Cloud Run 배포는 아직 확인하지 않았습니다. 해커톤의 **Cloud Run 실행 + Google Cloud AI 실제 사용** 조건은 실제 배포·호출 기록을 확보해야 충족됩니다. 준비할 정보와 명령은 [사용자 대응 안내](docs/USER_SETUP.md), 설계는 [ARCHITECTURE.md](ARCHITECTURE.md), API는 [API 계약](docs/API_CONTRACT.md)을 참고하세요.
+GCP Vertex AI의 실제 모델 호출은 확인했습니다. 2026-10-15에 정상·결원·재고 부족·기존 주문 위험·영업 전·마감 후의 합성6개 상황 모두 결과 계약을 통과했고, 관측 결과를 참조한 후보 수정도 확인했습니다. 실제 Google 로그인·원격 Firestore·Cloud Run 배포는 아직 별도 설정과 실환경 검증이 필요합니다. 해커톤의 **Cloud Run 실행 + Google Cloud AI 실제 사용** 조건 중 공개 배포는 배포 기록을 확보해야 충족됩니다. 준비할 정보와 명령은 [사용자 대응 안내](docs/USER_SETUP.md), 설계는 [ARCHITECTURE.md](ARCHITECTURE.md), API는 [API 계약](docs/API_CONTRACT.md)을 참고하세요.
 
 수요는 정상 영업일의 최근 판매 평균과 시간대별 기록으로 계산합니다. 시간대 표본이 부족하면 균등 배분을 명시합니다. 재고는 로트별 유효기간·예약량과 FIFO 예약을 사용하며, 직원별 메뉴 작업 시간은 등록된 고정값입니다. 실제 POS·결제·자동 발주·월간 시프트 자동 생성은 후속 범위입니다. 표시되는 매출과 대기 시간은 해당 가정에 따른 비교 값입니다.

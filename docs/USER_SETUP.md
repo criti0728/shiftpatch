@@ -1,6 +1,6 @@
 # ShiftPatch 공개 샘플 매장 — 구현 상태와 준비할 것
 
-업데이트: 2026-10-11
+업데이트: 2026-10-15
 
 ## 1. 사용자가 들어오는 방식
 
@@ -24,7 +24,7 @@
 | Firestore 영속 저장 | 완료 | 실제 SDK·protobuf 및 트랜잭션 재시도 테스트, 원격 DB는 설정 후 확인 필요 |
 | Cloud Run 컨테이너·웹/API 통합 | 코드 완료 | 정적 웹/API 통합 테스트 통과. Docker 빌드는 로컬 Docker 저장소의 I/O 오류로 완료하지 못함 |
 | 공개 배포 스크립트 | 완료 | 설정 생성·명령/REST 계약 확인, 실제 프로젝트 배포는 준비 후 실행 |
-| Gemini 도구 선택·후보 수정 루프 | 완료 | 계약 테스트, 실제 모델 호출·품질은 프로젝트 연결 후 확인 필요 |
+| Gemini 도구 선택·후보 수정 루프 | 완료 | Vertex Gemini 합성6개 상황 실호출 통과, 관측 후 후보 수정 확인; 실매장 효과는 평가 범위 밖 |
 | 호출 한도·만료 정리·브라우저 직접 DB 접근 차단 | 완료 | 지속되는 사용량 제한과 격리 테스트, 원격 Rules·TTL는 배포 시 적용 |
 
 현재 PC의 `http://127.0.0.1:5173`에서 개인별 샘플 체험이 작동한다. 인터넷에서 들어올 공개 URL은 Cloud Run 배포 후 생긴다. 실제 Google Cloud 사용을 증명해야 하는 해커톤 조건은 **실제 배포와 Gemini 호출 기록까지 확보한 뒤** 충족했다고 설명한다.
@@ -77,15 +77,16 @@ gcloud auth application-default set-quota-project 실제-프로젝트-ID
 SHIFTPATCH_ENV=development
 SHIFTPATCH_STORAGE=sqlite
 SHIFTPATCH_AI_MODE=gemini
+SHIFTPATCH_GEMINI_PROVIDER=vertex
 GOOGLE_CLOUD_PROJECT=실제-프로젝트-ID
 GOOGLE_CLOUD_LOCATION=global
-SHIFTPATCH_GEMINI_MODEL=gemini-3.5-flash
+SHIFTPATCH_GEMINI_MODEL=gemini-3.8-flash
 SHIFTPATCH_FIREBASE_API_KEY=Firebase-Web-apiKey
 SHIFTPATCH_FIREBASE_AUTH_DOMAIN=실제-프로젝트-ID.firebaseapp.com
 SHIFTPATCH_FIREBASE_APP_ID=Firebase-Web-appId
 ```
 
-`gemini-3.5-flash`는 2026-10-11 기준 확인한 함수 호출 지원 모델 예시다. 프로젝트의 모델 접근 가능 여부는 실제 호출로 확인한다. [모델 상세](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/3-5-flash)
+`gemini-3.8-flash`는 이 프로젝트에서 작은 Vertex AI 응답을 확인한 모델이다. 연결 확인 스크립트와 앱은 같은 `.env` 설정을 사용한다. 다른 프로젝트의 모델 접근 가능 여부는 `python3 scripts/check_gemini.py`로 실제 호출해 확인한다. [모델 상세](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/gemini/3-8-flash)
 
 설정을 바꾼 뒤 개발 서버를 재시작한다. 같은 코드에서 `SHIFTPATCH_STORAGE=firestore`로 바꾸면 원격 저장소를 사용한다. 클라우드가 아직 준비되지 않았다면 기본 `calculation_only`와 `sqlite`로 모든 운영 조작을 체험한다.
 
@@ -145,7 +146,7 @@ Google 로그인을 나중에 연결하려면 `--firebase-config` 없이 게스�
 6. Gemini 운영안 생성 → 실행 기록의 모델 도구 선택·계산 뒤 후보 수정 확인 → 점장 승인 후 판매 조건 반영.
 7. 재고 부족·직원 결원 각각 다른 조회/후보가 나오는지 확인하고 해커톤 제출용 기록 확보.
 
-실제 Cloud Run·원격 Firestore·Google 로그인·Gemini 응답 품질은 프로젝트가 없어서 아직 실환경 검증하지 않았다. 코드·로컬 테스트·배포 준비와 실제 배포 완료를 구분한다.
+실제 Vertex Gemini 합성6개 상황 검증은 2026-10-15에 통과했다. 실제 Cloud Run·원격 Firestore·Google 로그인은 별도 설정 후 실환경 검증이 필요하다. 합성 모델 행동 검증·로컬 테스트·배포 준비와 실제 배포 완료를 구분한다.
 
 
 ## API 키로 먼저 Gemini 검증하기
