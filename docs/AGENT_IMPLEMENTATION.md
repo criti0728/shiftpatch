@@ -32,7 +32,7 @@
 | [schemas.py](../backend/app/agent/schemas.py) | Pydantic 도구 인자·최종 JSON 스키마, 모드별 도구 목록 |
 | [dispatcher.py](../backend/app/agent/dispatcher.py) | 고정 스냅샷 조회, 인자·ID 검사, 계산 실행, 중복 계산 캐시, 결과 ID와 출처 기록 |
 | [result_validator.py](../backend/app/agent/result_validator.py) | 추천·설명·준비안이 실제 계산 결과를 참조하는지 검사 |
-| [prompts.py](../backend/app/agent/prompts.py) | 공통 지침, 영업 전·중·후 지침, 버전 `shiftpatch-agent-v2` |
+| [prompts.py](../backend/app/agent/prompts.py) | 공통 지침, 영업 전·중·후 전용 결과 스키마, 버전 `shiftpatch-agent-v3` |
 | [simulation/engine.py](../backend/app/simulation/engine.py) | 직원·작업대·예약 재고를 반영한 결정론적 시뮬레이션 |
 | [planning/forecast.py](../backend/app/planning/forecast.py) | 과거 판매 기록과 제한 여부를 반영한 수요 기준 |
 | [planning/prep.py](../backend/app/planning/prep.py) | 목표 영업일의 근무 가능량·준비량·재료 부족량 계산 |
@@ -139,7 +139,7 @@ Gemini에 처음부터 모든 직원 준비 시간·재고·대기 주문을 한
 
 | 항목 | 현재 구현 |
 | --- | --- |
-| 에이전트 실행 시간 | 40초, 새 모델 작업에는 마지막 5초를 남기도록 검사 |
+| 에이전트 실행 시간 | `SHIFTPATCH_AI_TIMEOUT_SECONDS`: 10~180초, 미설정40초. 실제 다단계 분석은120초 권장. 새 모델 작업에 마지막5초 저장 여유를 남김 |
 | API 외부 제한 | API 요청의 에이전트 호출에 별도 39초 제한 |
 | 모델 호출 | 최대 6회, 재시도와 형식 복구 포함 |
 | 모델 출력 | 호출당 `max_output_tokens=4096` |
@@ -157,6 +157,8 @@ Gemini에 처음부터 모든 직원 준비 시간·재고·대기 주문을 한
 후보의 `valid_until`은 계산 기준 시각과 검토 간격으로 서버가 정한다. 승인을 늦게 눌러도 검토 시각을 뒤로 밀지 않으며, 승인 전 직원·로트 시간 경계와 기존 주문 이행 조건을 다시 검사한다.
 
 후보 형식·제약 오류는 오류 결과로 모델에 돌려주어 제한 안에서 수정할 수 있다. 허용되지 않은 도구, 다른 매장·스냅샷·역할 주입은 실행을 실패시킨다. 일시적 연결 오류와 HTTP 408·429·5xx, JSON 형식·참조 오류는 공유 복구 예산 안에서만 재시도한다. 시간 초과 후 모델 응답을 성공 결과로 채택하지 않는다.
+
+실제 SDK 경로는 configured provider를 명시해 주변 SDK 환경 변수로 다른 API에 전환되지 않도록 한다. 매장 현지 영업시간/시간대/영업일을 모델 context에 전달하고, Gemini3/4는 LOW thinking으로 도구 사용과 결과 검증 시간을 확보한다. 병렬 함수 응답은 요청과 같은 개수의 native function_response part를 유지하고 남은 예산 안내는 함수 응답 JSON 안에 넣는다. 별도 text part를 섞어 SDK 다턴 계약을 깨뜨리지 않는다. 인증·권한·모델·사용량·네트워크 실패는 안전한 코드/HTTP 상태로 구분하며 원본 공급자 진단과 인증 정보는 저장하지 않는다.
 
 Gemini 설정 부족·연결 실패·예산 초과에서 `recommended_candidate_id`는 `null`이다. 이미 계산한 후보와 기록이 남더라도 실패한 제안을 승인 가능한 성공으로 바꾸지 않는다. 사용자는 계산 전용 모드를 명시적으로 선택해 별도 실행할 수 있다.
 

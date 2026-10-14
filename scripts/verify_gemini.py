@@ -15,8 +15,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'backend'))
-sys.path.insert(0, str(ROOT / 'scripts'))
-from dev import load_env
+from app.settings import GeminiSettings, agent_timeout_seconds, load_env
 from app.agent.runner import generate_proposal
 from app.agent.model_client import GeminiTransport
 from app.seed import seed_state
@@ -60,9 +59,16 @@ def observe(result, before, state, mode):
 
 
 async def main(args):
-    load_env()
-    # Verify must never quietly exercise the offline path.
-    os.environ['SHIFTPATCH_AI_MODE'] = 'gemini'
+    try:
+        load_env()
+        # Verify must never quietly exercise the offline path.
+        os.environ['SHIFTPATCH_AI_MODE'] = 'gemini'
+        settings = GeminiSettings.from_env()
+        settings.require_credentials()
+        timeout = agent_timeout_seconds()
+    except ValueError as exc:
+        print('Gemini 설정 실패: ' + str(exc), file=sys.stderr)
+        return 2
     try:
         check = GeminiTransport()
         await check.aclose()
@@ -87,6 +93,9 @@ async def main(args):
             # No SDK Content, thought signatures, prompts or credentials are saved.
             (out / f'{name}-{round_id+1}.json').write_text(json.dumps(result, ensure_ascii=False, indent=2))
             print(f"  {result['status']}; model={result.get('model_calls', 0)}; {result.get('elapsed_ms', 0)}ms", flush=True)
+            if result['status'] == 'failed':
+                status = result.get('provider_http_status')
+                print(f"  {result.get('error', 'agent_failed')}" + (f" (HTTP {status})" if status else '') + f": {result.get('summary', '')}", flush=True)
     service = [r for r in reports if r['scenario'] in {'normal', 'staff_absence', 'bread_shortage'} and r['validated_result'] and r['read_path']]
     paths = {json.dumps(r['read_path'], sort_keys=True) for r in service}
     adapted = len(paths) >= 2
@@ -95,7 +104,8 @@ async def main(args):
     full_suite = args.scenario == 'all'
     passed = all_valid and (adapted and revised if full_suite else True)
     summary = {'type': 'live_gemini', 'created_at': datetime.now(timezone.utc).isoformat(),
-               'model_id': os.getenv('SHIFTPATCH_GEMINI_MODEL'), 'rounds': args.rounds,
+               'model_id': settings.model, 'provider': settings.provider,
+               'execution_timeout_seconds': timeout, 'rounds': args.rounds,
                'scope': args.scenario, 'passed': passed, 'all_results_validated': all_valid,
                'different_investigation_paths_observed': adapted,
                'observed_result_based_revision': revised,

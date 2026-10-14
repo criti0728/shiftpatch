@@ -195,10 +195,34 @@ def test_developer_api_endpoint_configuration_uses_server_key_only(monkeypatch):
     assert captured['http_options'].base_url == 'https://gateway.example.com'
     assert captured['http_options'].retry_options.attempts == 1
     assert 'project' not in captured
+    assert captured.get('enterprise', captured.get('vertexai')) is False
     monkeypatch.setenv('SHIFTPATCH_GEMINI_ENDPOINT', 'https://gateway.example.com?key=test-secret')
     with pytest.raises(ValueError) as error:
         GeminiTransport()
     assert 'test-secret' not in str(error.value)
+
+
+@pytest.mark.parametrize('provider', ['developer', 'vertex'])
+def test_sdk_environment_flags_cannot_override_the_selected_provider(monkeypatch, provider):
+    from app.agent.model_client import GeminiTransport
+    monkeypatch.setenv('SHIFTPATCH_GEMINI_PROVIDER', provider)
+    monkeypatch.setenv('SHIFTPATCH_GEMINI_MODEL', 'configured-flash')
+    monkeypatch.setenv('GEMINI_API_KEY', 'test-secret')
+    monkeypatch.setenv('GOOGLE_CLOUD_PROJECT', 'configured-project')
+    monkeypatch.setenv('GOOGLE_CLOUD_LOCATION', 'global')
+    monkeypatch.setenv('GOOGLE_GENAI_USE_ENTERPRISE', 'true' if provider == 'developer' else 'false')
+    monkeypatch.setenv('GOOGLE_GENAI_USE_VERTEXAI', 'true' if provider == 'developer' else 'false')
+    monkeypatch.delenv('SHIFTPATCH_GEMINI_ENDPOINT', raising=False)
+    transport = GeminiTransport()
+    try:
+        assert transport.client._api_client.vertexai is (provider == 'vertex')
+        if provider == 'vertex':
+            assert transport.client._api_client.api_key is None
+            assert transport.client._api_client.project == 'configured-project'
+        else:
+            assert transport.client._api_client.api_key == 'test-secret'
+    finally:
+        asyncio.run(transport.aclose())
 
 
 def test_constraints_and_quantitative_prose_cannot_bypass_validation():

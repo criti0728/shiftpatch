@@ -10,8 +10,9 @@ from uuid import uuid4
 
 from app.timeutils import iso, parse_time
 from app.simulation.engine import ENGINE_VERSION
+from app.settings import agent_timeout_seconds
 from .dispatcher import AgentError, BoundaryViolation, BudgetExceeded, Dispatcher
-from .model_client import GeminiTransport, ModelReply, ModelTransport
+from .model_client import GeminiProviderError, GeminiTransport, ModelReply, ModelTransport
 from .prompts import PROMPT_VERSION, system_prompt
 from .result_validator import validate_final
 from .schemas import declarations
@@ -53,6 +54,10 @@ def _initial_context(snapshot, mode, objective, baseline, target_date):
     return {
         "mode": mode, "objective": objective, "service_date": snapshot["store"]["service_date"],
         "target_service_date": target_date,
+        "service_window": {"timezone": snapshot["store"].get("timezone", "Asia/Tokyo"),
+                           "open_time": snapshot["store"].get("open_time"),
+                           "close_time": snapshot["store"].get("close_time"),
+                           "time_filter_format": "HH:00 or HH:30 in the store's local timezone, not UTC"},
         "as_of": snapshot["business_now"], "revision": snapshot["revision"],
         "snapshot_scope": "server-authorized single store; read-only",
         "menu_ids": [menu["id"] for menu in snapshot["menus"]],
@@ -136,7 +141,7 @@ def structured_questions(questions):
     return result
 
 
-async def _run_model(dispatcher, proposal, objective, transport, started):
+async def _run_model(dispatcher, proposal, objective, transport, started, total_seconds):
     baseline = dispatcher.baseline() if dispatcher.mode == "in_service" else None
     if baseline:
         dispatcher.tool_count += 1
@@ -147,7 +152,7 @@ async def _run_model(dispatcher, proposal, objective, transport, started):
     repairs = 0
     requested_tools = 0
     for index in range(MAX_MODEL_CALLS):
-        remaining = TOTAL_SECONDS - SAVE_RESERVE_SECONDS - (monotonic() - started)
+        remaining = total_seconds - SAVE_RESERVE_SECONDS - (monotonic() - started)
         if remaining <= 0:
             raise BudgetExceeded("分析の制限時間に達しました。再実行してください。")
         if _input_size(messages, system, specs) > MAX_MODEL_INPUT_CHARACTERS:
@@ -173,6 +178,14 @@ async def _run_model(dispatcher, proposal, objective, transport, started):
                     await asyncio.gather(pending, return_exceptions=True)
         except TimeoutError as exc:
             raise BudgetExceeded("モデル応答が制限時間に達しました。再実行してください。") from exc
+        except GeminiProviderError as exc:
+            _record_usage(proposal, getattr(transport, "last_usage", {}))
+            if not exc.retryable or repairs >= 1:
+                raise
+            repairs += 1
+            dispatcher.record("model_retry", {}, {"reason": str(exc), "error_code": exc.code,
+                                                  "provider_http_status": exc.http_status}, "server")
+            continue
         except (ValueError, ConnectionError, OSError) as exc:
             _record_usage(proposal, getattr(transport, "last_usage", {}))
             if repairs >= 1:
@@ -191,7 +204,7 @@ async def _run_model(dispatcher, proposal, objective, transport, started):
                 raise BoundaryViolation("1応答のツール呼出し数または応答形式が不正です。")
             responses = []
             for call in reply.calls:
-                if monotonic() - started >= TOTAL_SECONDS - SAVE_RESERVE_SECONDS:
+                if monotonic() - started >= total_seconds - SAVE_RESERVE_SECONDS:
                     raise BudgetExceeded("分析の制限時間に達しました。")
                 if dispatcher.progress:
                     dispatcher.progress('calculate' if call.name in {'simulate_service_plan', 'calculate_prep', 'calculate_next_day_prep', 'estimate_sales', 'compare_plan_actual'} else 'investigate', dispatcher.trace)
@@ -199,10 +212,27 @@ async def _run_model(dispatcher, proposal, objective, transport, started):
                 result['call_id'] = call.id or result['call_id']
                 dispatcher.trace[-1]["model_call"] = index + 1
                 dispatcher.trace[-1]["call_id"] = result["call_id"]
+                if not dispatcher.trace[-1].get('cached'):
+                    # The stored observation must identify the same native call
+                    # as its response and trace. Cached observations retain the
+                    # original call while each cache-use trace gets its new ID.
+                    dispatcher.results[result['result_id']]['call_id'] = result['call_id']
                 function_response = {"name": call.name, "response": result}
                 if call.id:
                     function_response["id"] = call.id
                 responses.append({"function_response": function_response})
+            # Native parallel function turns require a matching response part
+            # for each call. Attach control metadata inside the response JSON,
+            # never as an extra text part alongside the function responses.
+            responses[-1]["function_response"]["response"].update({
+                "execution_budget": {
+                    "remaining_model_calls": MAX_MODEL_CALLS - index - 1,
+                    "remaining_executed_tools": MAX_TOOLS - dispatcher.tool_count,
+                    "remaining_candidates": MAX_CANDIDATES - len(dispatcher.candidates),
+                    "remaining_seconds": max(0, round(total_seconds - SAVE_RESERVE_SECONDS - (monotonic() - started))),
+                },
+                "instruction": "Use already observed evidence when sufficient; final JSON also needs one model call. Batch independent calls; obtain only information needed for this incident.",
+            })
             messages.append({"role": "user", "parts": responses})
             continue
         try:
@@ -250,6 +280,7 @@ async def generate_proposal(snapshot: dict, mode: str, objective: str, *,
     source = os.environ.get("SHIFTPATCH_AI_MODE", "calculation_only")
     if source not in {"calculation_only", "gemini"}:
         raise ValueError("SHIFTPATCH_AI_MODE は calculation_only または gemini です。")
+    total_seconds = agent_timeout_seconds(default=TOTAL_SECONDS)
     started = monotonic()
     proposal = {
         "id": f"proposal-{uuid4().hex}", "mode": mode,
@@ -272,7 +303,7 @@ async def generate_proposal(snapshot: dict, mode: str, objective: str, *,
     dispatcher = Dispatcher(private_snapshot, mode, proposal["trace"], max_tools=MAX_TOOLS, max_candidates=MAX_CANDIDATES, progress=progress, constraints=snapshot.get("request_context", {}).get("constraints"))
     own_transport = None
     try:
-        async with asyncio.timeout(TOTAL_SECONDS):
+        async with asyncio.timeout(total_seconds):
             if source == "calculation_only":
                 _calculation_only(dispatcher, proposal, objective)
             else:
@@ -280,15 +311,18 @@ async def generate_proposal(snapshot: dict, mode: str, objective: str, *,
                     own_transport = GeminiTransport()
                     transport = own_transport
                 proposal["model_id"] = getattr(transport, "model", "injected-test-transport")
-                await _run_model(dispatcher, proposal, objective, transport, started)
+                await _run_model(dispatcher, proposal, objective, transport, started, total_seconds)
             proposal['phase'] = 'validate'
             if dispatcher.progress:
                 dispatcher.progress('validate', dispatcher.trace)
-            if monotonic() - started >= TOTAL_SECONDS:
+            if monotonic() - started >= total_seconds:
                 raise BudgetExceeded("分析の制限時間に達しました。")
     except (TimeoutError, BudgetExceeded) as exc:
         proposal.update(status="failed", error="budget_exceeded", recommended_candidate_id=None,
                         summary=str(exc) or "分析がタイムアウトしました。再実行してください。")
+    except GeminiProviderError as exc:
+        proposal.update(status="failed", error=exc.code, recommended_candidate_id=None,
+                        summary=str(exc), provider_http_status=exc.http_status)
     except (AgentError, ValueError, ImportError) as exc:
         proposal.update(status="failed", error="agent_failed", recommended_candidate_id=None, summary=str(exc))
     except Exception:

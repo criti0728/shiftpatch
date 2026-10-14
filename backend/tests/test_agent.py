@@ -99,6 +99,7 @@ def test_calculation_only_has_real_metrics_without_fake_ai(monkeypatch):
 
 def test_gemini_missing_configuration_is_explicit_failure(monkeypatch):
     monkeypatch.setenv("SHIFTPATCH_AI_MODE", "gemini")
+    monkeypatch.setenv("SHIFTPATCH_GEMINI_PROVIDER", "vertex")
     for name in ("GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION", "SHIFTPATCH_GEMINI_MODEL"):
         monkeypatch.delenv(name, raising=False)
     proposal = generate()
@@ -192,6 +193,7 @@ def test_execution_budget_and_candidate_validation():
 
 def test_model_timeout_stops_without_recommendation(monkeypatch):
     monkeypatch.setenv("SHIFTPATCH_AI_MODE", "gemini")
+    monkeypatch.delenv("SHIFTPATCH_AI_TIMEOUT_SECONDS", raising=False)
     monkeypatch.setattr(runner, "TOTAL_SECONDS", 0.03)
     monkeypatch.setattr(runner, "SAVE_RESERVE_SECONDS", 0)
 
@@ -248,6 +250,19 @@ def test_no_mutation_tool_is_exposed_in_any_mode():
             assert "simulate_service_plan" not in names
 
 
+def test_mode_specific_final_schemas_exclude_incompatible_plan_fields():
+    from app.agent.prompts import final_schema
+    service = final_schema('in_service')['properties']
+    assert 'recommended_candidate_id' in service and 'candidate_notes' in service
+    assert not {'plan_result_id', 'sales_basis_result_id', 'comparison_result_id'} & service.keys()
+    before = final_schema('pre_open')['properties']
+    after = final_schema('post_close')['properties']
+    assert {'plan_result_id', 'sales_basis_result_id'} <= before.keys()
+    assert 'comparison_result_id' not in before
+    assert {'plan_result_id', 'sales_basis_result_id', 'comparison_result_id'} <= after.keys()
+    assert not {'recommended_candidate_id', 'candidate_notes'} & (before.keys() | after.keys())
+
+
 def test_sdk_boundary_preserves_content_and_disables_auto_execution():
     """Use real SDK types but fake HTTP; not a live Gemini credentials check."""
     from types import SimpleNamespace
@@ -266,7 +281,7 @@ def test_sdk_boundary_preserves_content_and_disables_auto_execution():
             return types.GenerateContentResponse(candidates=[types.Candidate(content=raw_content)])
 
     transport = GeminiTransport.__new__(GeminiTransport)
-    transport.model = "configured-model"
+    transport.model = "gemini-3.8-flash"
     transport.client = SimpleNamespace(aio=SimpleNamespace(models=FakeModels()))
     previous = types.Content(role="model", parts=[types.Part(
         function_call=types.FunctionCall(name="read_inventory", args={}, id="previous"),
@@ -281,9 +296,98 @@ def test_sdk_boundary_preserves_content_and_disables_auto_execution():
     assert captured["contents"][0] is previous
     assert captured["contents"][1].parts[0].function_response.id == "previous"
     assert captured["config"].automatic_function_calling.disable is True
+    assert captured["config"].thinking_config.thinking_level == 'LOW'
+    assert captured["config"].thinking_config.include_thoughts is False
     candidate_declaration = next(item for item in declarations("in_service") if item["name"] == "simulate_service_plan")
     candidate_properties = candidate_declaration["parameters_json_schema"]["properties"]["candidate_spec"]["properties"]
     assert "title" in candidate_properties
+
+
+def test_native_call_ids_are_preserved_in_observations_and_cached_replies(monkeypatch):
+    monkeypatch.setenv("SHIFTPATCH_AI_MODE", "gemini")
+    transport = Replies(
+        ModelReply(calls=[ToolCall("read_inventory", {}, "first-native-call")]),
+        ModelReply(calls=[ToolCall("read_inventory", {}, "cached-native-call")]),
+        ModelReply(final={
+            "outcome": "needs_input", "summary": "運営の優先順位を確認してください。",
+            "questions": [{"id": "priority", "text": "何を優先しますか？", "field": "objective",
+                           "options": ["balanced", "preserve_drinks"]}],
+        }),
+    )
+    proposal = generate(transport=transport)
+    assert proposal["status"] == "waiting_input"
+    observed = response_result(transport.messages[1])
+    cached = response_result(transport.messages[2])
+    result_id = observed["result_id"]
+    assert observed["call_id"] == "first-native-call"
+    assert cached["call_id"] == "cached-native-call"
+    assert cached["result_id"] == result_id
+    assert proposal["results"][result_id]["call_id"] == "first-native-call"
+    reads = [step for step in proposal["trace"] if step["tool"] == "read_inventory"]
+    assert [step["call_id"] for step in reads] == ["first-native-call", "cached-native-call"]
+    assert reads[1]["cached"]
+    context = json.loads(transport.messages[0][0]["parts"][0]["text"])
+    assert context["service_window"]["timezone"] == "Asia/Tokyo"
+    assert context["service_window"]["open_time"] == "11:00"
+    budget = transport.messages[1][-1]["parts"][-1]["function_response"]["response"]["execution_budget"]
+    assert budget["remaining_model_calls"] == 5
+    assert budget["remaining_executed_tools"] == 10
+
+
+@pytest.mark.parametrize("status,code,expected_calls", [
+    (400, "model_request_invalid", 1),
+    (401, "model_authentication_failed", 1),
+    (403, "model_permission_denied", 1),
+    (404, "model_not_found", 1),
+    (429, "model_rate_limited", 2),
+    (503, "model_unavailable", 2),
+])
+def test_provider_errors_preserve_safe_diagnostics_without_credentials(monkeypatch, status, code, expected_calls):
+    from types import SimpleNamespace
+    from google.genai.errors import APIError
+    from app.agent.model_client import GeminiTransport
+
+    monkeypatch.setenv("SHIFTPATCH_AI_MODE", "gemini")
+    captured = {"calls": 0}
+
+    class FailingModels:
+        async def generate_content(self, **kwargs):
+            captured["calls"] += 1
+            raise APIError(status, {"error": {"message": "test-secret-do-not-leak", "code": status}})
+
+    transport = GeminiTransport.__new__(GeminiTransport)
+    transport.model = "configured-model"
+    transport.client = SimpleNamespace(aio=SimpleNamespace(models=FailingModels()))
+    proposal = generate(transport=transport)
+    assert proposal["status"] == "failed"
+    assert proposal["source"] == "gemini"
+    assert proposal["error"] == code
+    assert proposal["provider_http_status"] == status
+    assert proposal["recommended_candidate_id"] is None
+    assert captured["calls"] == expected_calls
+    assert "test-secret-do-not-leak" not in json.dumps(proposal)
+
+
+def test_missing_adc_reports_authentication_failure_without_raw_details(monkeypatch):
+    from types import SimpleNamespace
+    from google.auth.exceptions import DefaultCredentialsError
+    from app.agent.model_client import GeminiTransport
+
+    monkeypatch.setenv("SHIFTPATCH_AI_MODE", "gemini")
+
+    class MissingCredentialsModels:
+        async def generate_content(self, **kwargs):
+            raise DefaultCredentialsError("private-credential-path-and-account")
+
+    transport = GeminiTransport.__new__(GeminiTransport)
+    transport.model = "configured-model"
+    transport.client = SimpleNamespace(aio=SimpleNamespace(models=MissingCredentialsModels()))
+    proposal = generate(transport=transport)
+    assert proposal["status"] == "failed"
+    assert proposal["error"] == "model_authentication_failed"
+    assert proposal["model_calls"] == 1
+    assert "gcloud auth application-default login" in proposal["summary"]
+    assert "private-credential-path-and-account" not in json.dumps(proposal)
 
 
 def test_reported_token_budget_stops_further_model_calls(monkeypatch):

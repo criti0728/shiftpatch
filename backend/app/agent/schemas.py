@@ -38,8 +38,8 @@ class CandidateSpec(StrictModel):
     action: Literal["replace_limits"] = "replace_limits"
     limits: dict[str, StrictInt]
     review_after_minutes: Literal[15, 30] = 30
-    parent_candidate_id: str | None = None
-    based_on_result_ids: list[str] = Field(min_length=1, max_length=12)
+    parent_candidate_id: str | None = Field(default=None, description="Optional observed parent candidate ID. A revision must include the parent's own simulation result_id in based_on_result_ids.")
+    based_on_result_ids: list[str] = Field(min_length=1, max_length=12, description="Observed result IDs supporting this calculation. When parent_candidate_id is present, include that parent's simulation result ID, not merely earlier reads or the baseline.")
 
 
 class SimulateArgs(StrictModel):
@@ -61,9 +61,9 @@ class NextDayArgs(StrictModel):
 
 class CandidateNote(StrictModel):
     candidate_id: str
-    summary: str = Field(min_length=1, max_length=500)
+    summary: str = Field(min_length=1, max_length=500, description="Qualitative reason only. Do not put numeric counts, prices, percentages or durations here; calculated metrics are displayed separately.")
     evidence_refs: list[str] = Field(min_length=1, max_length=12)
-    tradeoff: str = Field(min_length=1, max_length=500)
+    tradeoff: str = Field(min_length=1, max_length=500, description="Qualitative tradeoff without numeric counts, prices, percentages or durations.")
 
 
 class Question(StrictModel):
@@ -80,7 +80,7 @@ class Constraints(StrictModel):
 
 class FinalAnswer(StrictModel):
     outcome: Literal["ready", "needs_input", "no_feasible_plan"]
-    summary: str = Field(min_length=1, max_length=1000)
+    summary: str = Field(min_length=1, max_length=1000, description="Qualitative observed conclusion only. Do not repeat numeric counts, prices, percentages or durations; the UI renders calculated metrics separately.")
     recommended_candidate_id: str | None = None
     candidate_notes: list[CandidateNote] = Field(default_factory=list, max_length=5)
     evidence_refs: list[str] = Field(default_factory=list, max_length=12)
@@ -97,7 +97,7 @@ TOOL_SCHEMAS = {
     "read_queue": (QueueArgs, "Read existing orders and staff/station occupancy; existing commitments must be preserved."),
     "read_current_mode": (EmptyArgs, "Read current limits, amounts already used and review time."),
     "read_menu_recipes": (EmptyArgs, "Read menu categories, prices, stations and ingredient recipes."),
-    "estimate_sales": (SalesArgs, "Calculate daily and 30-minute demand basis. Optional start_time/end_time select service-window buckets (HH:00 or HH:30); prep still uses the full daily forecast. Restricted sales are not normal demand."),
+    "estimate_sales": (SalesArgs, "Calculate daily and 30-minute demand basis. Optional start_time/end_time select service-window buckets (HH:00 or HH:30 in the store's local timezone, not UTC); omit them for the entire service day. Prep still uses the full daily forecast. Restricted sales are not normal demand."),
     "simulate_service_plan": (SimulateArgs, "Calculate a candidate. Supply every menu limit (0..100), and refer to observed result IDs. Revise using parent_candidate_id after seeing results."),
     "calculate_prep": (PrepArgs, "Calculate today's preparation, referring to this run's estimate_sales result."),
     "read_close_record": (EmptyArgs, "Read this service day's confirmed close record."),
