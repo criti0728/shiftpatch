@@ -63,7 +63,7 @@ def main():
     parser.add_argument("--firebase-config", type=Path,
                         help="JSON object with apiKey, authDomain, projectId and appId from Firebase Web app")
     parser.add_argument("--ai-mode", choices=["gemini", "calculation_only"], default="gemini")
-    parser.add_argument("--model", default="gemini-3.5-flash")
+    parser.add_argument("--model", default="gemini-3.8-flash")
     parser.add_argument("--plan", action="store_true", help="Print configuration without changing Cloud resources")
     args = parser.parse_args()
     if not re.fullmatch(r"[a-z][a-z0-9-]{4,28}[a-z0-9]", args.project):
@@ -88,6 +88,7 @@ def main():
         "SHIFTPATCH_ENV": "production", "SHIFTPATCH_STORAGE": "firestore",
         "GOOGLE_CLOUD_PROJECT": args.project, "GOOGLE_CLOUD_LOCATION": "global",
         "SHIFTPATCH_AI_MODE": args.ai_mode, "SHIFTPATCH_GEMINI_MODEL": args.model,
+        "SHIFTPATCH_GEMINI_PROVIDER": "vertex",
         "SHIFTPATCH_PUBLIC_ORIGIN": "https://localhost",
         "SHIFTPATCH_WEB_DIST": "/srv/web",
         "SHIFTPATCH_ALLOWED_HOSTS": "*.run.app", "SHIFTPATCH_COOKIE_SECURE": "true",

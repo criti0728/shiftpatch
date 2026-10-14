@@ -7,8 +7,9 @@ dispatcher. The raw model Content is retained for function-call signatures.
 from dataclasses import dataclass, field
 import inspect
 import json
-import os
 from typing import Any, Protocol
+
+from app.settings import GeminiSettings
 
 
 @dataclass
@@ -31,50 +32,60 @@ class ModelTransport(Protocol):
                        declarations: list[dict]) -> ModelReply: ...
 
 
+class GeminiProviderError(Exception):
+    """Public diagnostics assembled locally, never from a provider response."""
+
+    def __init__(self, code: str, message: str, *, http_status: int | None = None,
+                 retryable: bool = False):
+        super().__init__(message)
+        self.code = code
+        self.http_status = http_status
+        self.retryable = retryable
+
+
+def _api_error(status: int | None) -> GeminiProviderError:
+    diagnostics = {
+        400: ('model_request_invalid', 'Geminiへのリクエストが拒否されました。モデル・APIバージョン・接続先を確認してください。'),
+        401: ('model_authentication_failed', 'Gemini認証が無効です。APIキー、または gcloud auth application-default login の認証を更新してください。'),
+        403: ('model_permission_denied', 'Geminiへのアクセスが拒否されました。認証アカウント・プロジェクトの Vertex AI 権限・APIの有効化・キーの制限を確認してください。'),
+        404: ('model_not_found', '指定したGeminiモデルまたは接続先が見つかりません。モデルID・リジョン・APIのベースURLを確認してください。'),
+        429: ('model_rate_limited', 'Geminiの利用制限に達しました。プロジェクトのクォータ・課金・クレジット残高を確認して再実行してください。'),
+    }
+    code, message = diagnostics.get(status, ('model_unavailable', 'Geminiサービスに接続できません。接続先とサービスの状態を確認して再実行してください。'))
+    return GeminiProviderError(code, message, http_status=status,
+                               retryable=status in (408, 429) or bool(status and status >= 500))
+
+
 class GeminiTransport:
     """Google native Gemini API; Developer API key or Cloud ADC authentication."""
 
     def __init__(self):
-        from urllib.parse import urlparse
         from google import genai
         from google.genai import types
-        self.model = os.getenv('SHIFTPATCH_GEMINI_MODEL', '').strip()
-        if not self.model:
-            raise ValueError('Gemini設定が不足しています: SHIFTPATCH_GEMINI_MODEL, GOOGLE_CLOUD_PROJECT (Cloud認証の場合)')
-        provider = os.getenv('SHIFTPATCH_GEMINI_PROVIDER', 'auto')
-        key = os.getenv('GEMINI_API_KEY') or os.getenv('GOOGLE_API_KEY')
-        if provider == 'auto':
-            provider = 'developer' if key else 'vertex'
-        if provider not in {'developer', 'vertex'}:
-            raise ValueError('SHIFTPATCH_GEMINI_PROVIDER は developer / vertex / auto です。')
-        endpoint = os.getenv('SHIFTPATCH_GEMINI_ENDPOINT', '').strip()
-        if endpoint:
-            parsed = urlparse(endpoint)
-            if not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment or (parsed.scheme != 'https' and not (parsed.scheme == 'http' and parsed.hostname in {'localhost', '127.0.0.1', '::1'})):
-                raise ValueError('Gemini endpoint はHTTPSのベースURL（ローカルのみHTTP可）を指定してください。')
-            if ':generateContent' in endpoint or '/models/' in parsed.path:
-                raise ValueError('モデルの完全なURLではなくAPIのベースURLを指定してください。')
+        settings = GeminiSettings.from_env()
+        settings.require_credentials()
+        self.model = settings.model
+        self.provider = settings.provider
         self.last_usage = {}
         options = types.HttpOptions(
-            api_version=os.getenv('SHIFTPATCH_GEMINI_API_VERSION', 'v1beta' if provider == 'developer' else 'v1'),
-            base_url=endpoint or None, timeout=30_000,
+            api_version=settings.api_version,
+            base_url=settings.endpoint or None, timeout=30_000,
             retry_options=types.HttpRetryOptions(attempts=1),
         )
-        if provider == 'developer':
-            if not key:
-                raise ValueError('Gemini設定が不足しています: GEMINI_API_KEY')
-            self.client = genai.Client(api_key=key, http_options=options)
+        # Select both paths explicitly: SDK environment flags must not reroute a
+        # configured Developer key to Vertex, or vice versa.
+        selector = 'enterprise' if 'enterprise' in inspect.signature(genai.Client).parameters else 'vertexai'
+        if settings.provider == 'developer':
+            self.client = genai.Client(**{selector: False}, api_key=settings.api_key, http_options=options)
         else:
-            missing = [name for name in ('GOOGLE_CLOUD_PROJECT', 'GOOGLE_CLOUD_LOCATION') if not os.getenv(name)]
-            if missing:
-                raise ValueError('Gemini設定が不足しています: ' + ', '.join(missing))
-            selector = 'enterprise' if 'enterprise' in inspect.signature(genai.Client).parameters else 'vertexai'
-            self.client = genai.Client(**{selector: True}, project=os.environ['GOOGLE_CLOUD_PROJECT'],
-                                       location=os.environ['GOOGLE_CLOUD_LOCATION'], http_options=options)
+            self.client = genai.Client(**{selector: True}, project=settings.project,
+                                       location=settings.location, http_options=options)
 
     async def generate(self, messages, system_instruction, declarations):
+        from google.auth.exceptions import DefaultCredentialsError, RefreshError, TransportError
         from google.genai import types
         from google.genai.errors import APIError
+        from httpx import RequestError
         self.last_usage = {}
         try:
             response = await self.client.aio.models.generate_content(
@@ -87,13 +98,26 @@ class GeminiTransport:
                         types.FunctionDeclaration(**item) for item in declarations
                     ])],
                     automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+                    # The agent delegates arithmetic to deterministic tools. A
+                    # supported low thinking level leaves time for tool results
+                    # and validation inside the bounded interactive request.
+                    thinking_config=types.ThinkingConfig(thinking_level='LOW', include_thoughts=False)
+                    if self.model.startswith(('gemini-3', 'gemini-4')) else None,
                     temperature=0.2, max_output_tokens=4096,
                 ),
             )
         except APIError as exc:
-            if exc.code in (408, 429) or (exc.code and exc.code >= 500):
-                raise ConnectionError("Geminiの一時的な接続エラーです。") from exc
-            raise
+            raise _api_error(exc.code) from exc
+        except (DefaultCredentialsError, RefreshError) as exc:
+            raise GeminiProviderError(
+                'model_authentication_failed',
+                'GCP認証を利用できません。gcloud auth application-default login を実行するか、実行サービスの認証を確認してください。',
+            ) from exc
+        except (TransportError, RequestError) as exc:
+            raise GeminiProviderError(
+                'model_connection_failed', 'GeminiまたはGCP認証サービスに接続できません。ネットワークと接続先を確認してください。',
+                retryable=True,
+            ) from exc
         metadata = response.usage_metadata
         self.last_usage = {
             name: int(getattr(metadata, name, 0) or 0)
