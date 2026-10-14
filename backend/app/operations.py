@@ -349,6 +349,14 @@ def update_history(state, date, counts, restricted, windows=None):
     if entry is None:
         raise DomainError("not_found", "対象の営業記録がありません。", 404)
     if windows is not None:
+        from .planning.forecast import service_window
+        left, end = service_window(state, date)
+        valid_starts = set()
+        while left < end:
+            valid_starts.add(left.strftime('%H:%M'))
+            left += timedelta(minutes=30)
+        if any(w['start_time'] not in valid_starts for w in windows):
+            raise DomainError('invalid_windows', '時間帯は営業時間内の30分区間を指定してください。', 422)
         if any(set(w['counts']) != set(counts) for w in windows) or any(sum(w['counts'][key] for w in windows) != counts[key] for key in counts):
             raise DomainError('invalid_windows', '時間帯別販売数は日別販売数と一致させてください。', 422)
         entry['windows'] = windows

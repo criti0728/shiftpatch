@@ -309,3 +309,211 @@ def test_run_expired_before_final_save_cannot_become_ready(client, monkeypatch):
     assert result["error"] == "budget_exceeded"
     run = client.get(BASE + f"/agent-runs/{result['run_id']}").json()
     assert run["status"] == "timed_out"
+
+
+@pytest.mark.parametrize('window', [
+    {'start_time': 1100, 'counts': {}},
+    {'start_time': '11:00:00', 'counts': {}},
+    {'start_time': '25:00', 'counts': {}},
+    {'start_time': '11:00', 'counts': {'latte': True}},
+    {'start_time': '11:00', 'counts': {}, 'unexpected': 1},
+])
+def test_malformed_history_windows_return_validation_errors(client, window):
+    before = snapshot(client)
+    day = before['history'][0]
+    response = client.patch(BASE + '/history/' + day['date'],
+                            json={'counts': day['counts'], 'restricted': False, 'windows': [window]},
+                            headers={'Idempotency-Key': uuid4().hex})
+    assert response.status_code == 422
+    assert response.json()['detail']['code'] == 'invalid_input'
+    assert snapshot(client) == before
+
+
+@pytest.mark.parametrize('start', ['10:30', '11:15', '13:00'])
+def test_history_windows_must_match_service_intervals(client, start):
+    before = snapshot(client)
+    day = before['history'][0]
+    response = client.patch(BASE + '/history/' + day['date'],
+                            json={'counts': day['counts'], 'restricted': False,
+                                  'windows': [{'start_time': start, 'counts': day['counts']}]},
+                            headers={'Idempotency-Key': uuid4().hex})
+    assert response.status_code == 422
+    assert response.json()['detail']['code'] == 'invalid_windows'
+    assert snapshot(client) == before
+
+
+def test_history_windows_are_saved_and_used_in_time_profiles(client):
+    state = snapshot(client)
+    day = state['history'][0]
+    windows = [{'start_time': '11:00', 'counts': day['counts']}]
+    response = client.patch(BASE + '/history/' + day['date'],
+                            json={'counts': day['counts'], 'restricted': False, 'windows': windows},
+                            headers={'Idempotency-Key': uuid4().hex})
+    assert response.status_code == 200
+    assert response.json()['history'][0]['windows'] == windows
+
+
+def test_quota_rejection_does_not_consume_incident_or_request_key(client, monkeypatch):
+    response = client.patch(BASE + '/staff/yui', json={'absent': True},
+                            headers={'Idempotency-Key': uuid4().hex})
+    event = response.json()['replan_event']['id']
+    body = {'mode': 'in_service', 'trigger_event_id': event}
+    key = uuid4().hex
+    monkeypatch.setattr(client.app.state.identities, 'consume_quota', lambda *args, **kwargs: False)
+    assert post(client, '/proposals', body, key).status_code == 429
+    assert snapshot(client)['replan_required'] is True
+    assert snapshot(client)['active_run'] is None
+    monkeypatch.setattr(client.app.state.identities, 'consume_quota', lambda *args, **kwargs: True)
+    result = post(client, '/proposals', body, key)
+    assert result.status_code == 200, result.text
+    assert result.json()['status'] == 'ready'
+    assert snapshot(client)['replan_required'] is False
+
+
+def test_generation_timeout_preserves_completed_tool_trace(client, monkeypatch):
+    trace = [{'step': 1, 'origin': 'server', 'tool': 'read_queue', 'args': {},
+              'result_summary': 'Completed queue inspection'}]
+    async def timeout(snapshot, mode, objective, *, progress=None):
+        progress('investigate', trace)
+        raise TimeoutError()
+    monkeypatch.setattr('app.agent.runner.generate_proposal', timeout)
+    result = post(client, '/proposals', {'mode': 'pre_open'}).json()
+    assert result['status'] == 'failed'
+    assert result['error'] == 'budget_exceeded'
+    assert result['trace'] == trace
+    run = client.get(BASE + '/agent-runs/' + result['run_id']).json()
+    assert run['status'] == 'timed_out'
+    assert run['trace'] == trace
+
+
+def test_continuation_preserves_context_and_applies_preference_answers(client, monkeypatch):
+    contexts = []
+    async def ask_preferences(state, mode, objective):
+        contexts.append(deepcopy(state['request_context']))
+        result = {'source': 'calculation_only', 'summary': 'Choose a preference',
+                  'candidates': [], 'trace': [], 'objective': objective}
+        if not state['request_context'].get('parent_run_id'):
+            return {**result, 'status': 'waiting_input', 'questions': [
+                {'id': 'priority', 'text': 'Priority?', 'field': 'objective', 'options': ['balanced', 'reduce_delay']},
+                {'id': 'review', 'text': 'Review?', 'field': 'review_after_minutes', 'options': ['15', '30']},
+            ]}
+        return {**result, 'status': 'ready'}
+    monkeypatch.setattr('app.agent.runner.generate_proposal', ask_preferences)
+    first = post(client, '/proposals', {'mode': 'in_service', 'locale': 'ko-KR',
+                 'constraints': {'allowed_review_minutes': [30], 'allow_menu_pause': False}}).json()
+    child = post(client, '/proposals', {'mode': 'in_service', 'parent_run_id': first['run_id'],
+                 'answers': {'priority': 'reduce_delay', 'review': '15'}}).json()
+    assert child['status'] == 'ready'
+    assert child['parent_run_id'] == first['run_id']
+    assert child['service_date'] == first['service_date'] == snapshot(client)['store']['service_date']
+    assert child['objective'] == 'reduce_delay'
+    assert child['locale'] == contexts[-1]['locale'] == 'ko-KR'
+    assert child['constraints'] == {'allowed_review_minutes': [15], 'allow_menu_pause': False}
+    assert contexts[-1]['parent_summary'] == first['summary']
+    assert contexts[-1]['answers'] == {'priority': 'reduce_delay', 'review': '15'}
+    assert child['snapshot_id'] != first['snapshot_id']
+
+
+def test_fact_continuation_requires_the_questioned_data_to_be_saved(client, monkeypatch):
+    async def ask_stock(state, mode, objective):
+        return {'status': 'ready' if state['request_context'].get('parent_run_id') else 'waiting_input',
+                'source': 'calculation_only', 'summary': 'Confirm stock', 'candidates': [], 'trace': [],
+                'questions': [{'id': 'stock', 'text': 'Stock?', 'field': 'inventory', 'options': []}]}
+    monkeypatch.setattr('app.agent.runner.generate_proposal', ask_stock)
+    first = post(client, '/proposals', {'mode': 'pre_open'}).json()
+    body = {'mode': 'pre_open', 'parent_run_id': first['run_id'], 'answers': {'stock': 'updated'}}
+    assert post(client, '/proposals', body).json()['detail']['code'] == 'facts_not_updated'
+    assert client.patch(BASE + '/staff/yui', json={'absent': True},
+                        headers={'Idempotency-Key': uuid4().hex}).status_code == 200
+    # An unrelated staff edit also migrates legacy lot rows; that is not a stock correction.
+    assert post(client, '/proposals', body).json()['detail']['code'] == 'facts_not_updated'
+    assert post(client, '/inventory-adjustments', {'ingredient_id': 'milk', 'on_hand': 4500}).status_code == 200
+    child = post(client, '/proposals', body)
+    assert child.status_code == 200, child.text
+    assert child.json()['status'] == 'ready'
+
+
+def test_continuation_rejects_a_different_service_day_or_dismissed_parent(client, monkeypatch):
+    async def ask(state, mode, objective):
+        return {'status': 'waiting_input', 'source': 'calculation_only', 'summary': 'Priority',
+                'candidates': [], 'trace': [],
+                'questions': [{'id': 'priority', 'text': 'Priority?', 'field': 'objective', 'options': ['balanced']}]}
+    monkeypatch.setattr('app.agent.runner.generate_proposal', ask)
+    first = post(client, '/proposals', {'mode': 'pre_open'}).json()
+    body = {'mode': 'pre_open', 'parent_run_id': first['run_id'], 'answers': {'priority': 'balanced'}}
+    def previous_day(state):
+        next(p for p in state['proposals'] if p['id'] == first['id'])['service_date'] = '2026-10-10'
+    client.app.state.repository.transact(previous_day)
+    assert post(client, '/proposals', body).json()['detail']['code'] == 'invalid_parent'
+    assert post(client, '/proposals/' + first['id'] + '/dismiss').status_code == 200
+    assert post(client, '/proposals', body).json()['detail']['code'] == 'invalid_parent'
+
+
+def test_completed_continuation_replays_after_parent_dismissal_and_service_date_change(client, monkeypatch):
+    async def ask(state, mode, objective):
+        return {'status': 'ready' if state['request_context'].get('parent_run_id') else 'waiting_input',
+                'source': 'calculation_only', 'summary': 'Priority', 'candidates': [], 'trace': [],
+                'questions': [{'id': 'priority', 'text': 'Priority?', 'field': 'objective', 'options': ['balanced']}]}
+    monkeypatch.setattr('app.agent.runner.generate_proposal', ask)
+    parent = post(client, '/proposals', {'mode': 'pre_open'}).json()
+    key = uuid4().hex
+    body = {'mode': 'pre_open', 'parent_run_id': parent['run_id'], 'service_date': parent['service_date'],
+            'answers': {'priority': 'balanced'}}
+    child = post(client, '/proposals', body, key).json()
+    assert post(client, '/proposals/' + parent['id'] + '/dismiss').status_code == 200
+    assert post(client, '/proposals', body, key).json()['id'] == child['id']
+    def new_day(state):
+        state['store']['service_date'] = '2026-10-12'
+        state['revision'] += 1
+    client.app.state.repository.transact(new_day)
+    response = post(client, '/proposals', body, key)
+    assert response.status_code == 200, response.text
+    assert response.json()['id'] == child['id']
+    assert response.json()['status'] == 'stale'
+    conflict = post(client, '/proposals', {**body, 'answers': {}}, key)
+    assert conflict.status_code == 409
+    assert conflict.json()['detail']['code'] == 'idempotency_conflict'
+
+
+@pytest.mark.parametrize('status', ['failed', 'stale', 'expired_ready'])
+def test_parent_retry_preserves_preferences_and_rejects_answers(client, monkeypatch, status):
+    async def generated(state, mode, objective):
+        return {'status': 'ready', 'source': 'calculation_only', 'summary': 'Retry context',
+                'candidates': [], 'trace': [], 'objective': objective}
+    monkeypatch.setattr('app.agent.runner.generate_proposal', generated)
+    first = post(client, '/proposals', {'mode': 'pre_open', 'objective': 'reduce_delay', 'locale': 'ko-KR',
+                 'constraints': {'allowed_review_minutes': [15], 'allow_menu_pause': False}}).json()
+    def failed(state):
+        parent = next(p for p in state['proposals'] if p['id'] == first['id'])
+        if status == 'expired_ready':
+            parent['review_at'] = state['business_now']
+        else:
+            parent['status'] = status
+    client.app.state.repository.transact(failed)
+    body = {'mode': 'pre_open', 'parent_run_id': first['run_id']}
+    invalid = post(client, '/proposals', {**body, 'answers': {'priority': 'balanced'}})
+    assert invalid.status_code == 422
+    assert invalid.json()['detail']['code'] == 'invalid_answer'
+    child = post(client, '/proposals', body)
+    assert child.status_code == 200, child.text
+    result = child.json()
+    assert result['parent_run_id'] == first['run_id']
+    assert result['status'] == 'ready'
+    assert result['objective'] == 'reduce_delay'
+    assert result['locale'] == 'ko-KR'
+    assert result['constraints'] == first['constraints']
+
+
+@pytest.mark.parametrize('status', ['ready', 'applied', 'acknowledged', 'dismissed'])
+def test_current_or_used_parent_cannot_be_retried(client, monkeypatch, status):
+    async def generated(state, mode, objective):
+        return {'status': 'ready', 'source': 'calculation_only', 'summary': 'Current plan',
+                'candidates': [], 'trace': []}
+    monkeypatch.setattr('app.agent.runner.generate_proposal', generated)
+    first = post(client, '/proposals', {'mode': 'pre_open'}).json()
+    def used(state):
+        next(p for p in state['proposals'] if p['id'] == first['id'])['status'] = status
+    client.app.state.repository.transact(used)
+    result = post(client, '/proposals', {'mode': 'pre_open', 'parent_run_id': first['run_id']})
+    assert result.status_code == 422
+    assert result.json()['detail']['code'] == 'invalid_parent'

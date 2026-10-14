@@ -70,7 +70,7 @@ state = {
 proposal = {
  id, mode, type: prep_plan|service_plan|next_day_plan,
  status: ready|stale|applied|acknowledged|failed|waiting_input|dismissed,
- revision, source: gemini|calculation_only, created_at, review_at,
+ revision, service_date, source: gemini|calculation_only, created_at, review_at,
  recommended_candidate_id: string|null, summary,
  candidates: [{id, title, action: keep_current|replace_limits,
    limits: {menu_id: int}, review_after_minutes,
@@ -80,7 +80,7 @@ proposal = {
  trace: [{step, origin: server|model, tool, args, result_summary}],
  prep?: {service_date, forecast: {menu_id: int},
    items: [{ingredient_id, name, unit, needed, available, incoming, buffer, to_order}], notes: [string]},
- questions?: [{id,text,field,options}], error?: string
+ questions?: [{id,text,field,options}], error?: string, provider_http_status?: int
 }
 ```
 
@@ -108,7 +108,9 @@ proposal = {
 {"mode":"in_service","objective":"balanced","trigger_event_id":"서버 사건 ID", "service_date":"2026-10-11", "constraints":{"allowed_review_minutes":[15,30],"allow_menu_pause":true},"locale":"ja-JP"}
 ```
 
-답변 이어서 실행은 `{mode,parent_run_id,answers:{question_id:choice}}`다. 사실 질문의 choice는 운영 데이터 저장 후 `updated`, 선호 질문은 질문의 허용 선택값이다. 운영 사실을 채팅 답변으로 직접 변경하지 않는다. 다른 매장의 사건/부모 실행, 다른 모드/날짜, 알 수 없는 질문을 거부한다. 같은 사건 ID는 기존 실행에 연결하며, 중단/오래된 사건을 새로 분석하려면 사건 ID 없이 수동 요청한다.
+답변 이어서 실행은 `{mode,parent_run_id,answers:{question_id:choice}}`다. 부모는 확인 대기 제안이며 생략한 objective·constraints·locale는 상속한다. 사실 질문의 choice는 해당 질문 대상 필드(근무·재고·판매기록·마감)를 실제 저장한 뒤 `updated`, 선호 질문은 질문의 허용 선택값이다. 시계 진행이나 무관한 데이터 변경만으로 사실 질문에 답할 수 없다. 운영 사실을 채팅 답변으로 직접 변경하지 않는다. 실패·만료 제안을 재분석할 때는 같은 parent_run_id와 빈 answers로 새 실행을 만들며 원래 설정을 상속한다. 다른 매장의 사건/부모 실행, 다른 모드/대상날짜, 알 수 없는 질문을 거부한다. proposal.service_date는 모드가 분석하는 실제 영업일이다. 같은 사건 ID는 기존 실행에 연결하며, 중단/오래된 사건을 새로 분석하려면 사건 ID 없이 수동 요청한다.
+
+분석 시간은 `SHIFTPATCH_AI_TIMEOUT_SECONDS`로 설정하며 기본40초, 10~180초 범위다. 실행 lease와 모델/도구 대기·저장에 같은 예산을 적용한다. 공급자 오류는 안전한 코드와 안내로 반환하고 가능한 경우 HTTP 상태만 저장한다. 인증 정보와 원본 공급자 메시지는 공개하지 않는다. 401 인증·403 권한·404 모델·429 사용량·네트워크 오류를 구분하며 재시도 가능한 오류만 모델 호출 상한 안에서 재시도한다.
 
 overview에 `replan_required`, `replan_event:{id,message}`, `active_run:{id,status,phase,trace,cancel_requested?}`가 추가된다. 실행 상태는 `running|succeeded|waiting_input|stale|failed|timed_out|interrupted`다. 제안 상태와 분리되어 과거 성공 실행은 제안이 이후 만료돼도 성공 이력으로 남는다.
 
@@ -122,4 +124,4 @@ overview에 `replan_required`, `replan_event:{id,message}`, `active_run:{id,stat
 | POST `/clock` | `{mode:manual|realtime}` | 체험 시계 진행 방식 |
 | PATCH `/history/{date}` | `{counts,restricted,windows?:[{start_time:"11:00",counts:{menu_id:int}}]}` | 시간대별 실적 편집; 합계는 일별 판매량과 일치해야 함 |
 
-모든 경로는 기존처럼 소유권 검사와 Idempotency-Key를 사용한다. `read_inventory`는 로트, `read_queue`는 경과·잔여 시간, `estimate_sales`는 30분 구간·표본·관측/균등 분배 출처를 반환한다. `start_time`, `end_time` 필터는 해당 구간의 `window_forecast`를 제공하며 준비 계산에 쓰는 전체 일별 `forecast`를 바꾸지 않는다. SDK 함수 호출은 `call_id`로 공통 응답에 연결하며 숫자는 코드 계산 결과에서만 화면에 표시한다.
+모든 경로는 기존처럼 소유권 검사와 Idempotency-Key를 사용한다. history의 start_time은 매장 영업시각부터 시작하는 30분 구간의 HH:MM이며 중복·영업 구간 밖 값은 거부한다. `read_inventory`는 로트, `read_queue`는 경과·잔여 시간, `estimate_sales`는 30분 구간·표본·관측/균등 분배 출처를 반환한다. `start_time`, `end_time` 필터는 해당 구간의 `window_forecast`를 제공하며 준비 계산에 쓰는 전체 일별 `forecast`를 바꾸지 않는다. SDK 함수 호출은 `call_id`로 공통 응답과 저장 근거에 연결하며 숫자는 코드 계산 결과에서만 화면에 표시한다.

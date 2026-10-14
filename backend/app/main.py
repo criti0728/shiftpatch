@@ -134,23 +134,34 @@ class Advance(Body):
     minutes: Annotated[int, Field(strict=True, ge=1, le=120)]
 
 
+SalesCounts = dict[str, Annotated[int, Field(strict=True, ge=0, le=1000)]]
+
+
+class HistoryWindow(Body):
+    start_time: str = Field(pattern=r'^\d{2}:\d{2}$')
+    counts: SalesCounts
+
+    @field_validator('start_time')
+    @classmethod
+    def valid_time(cls, value):
+        from datetime import time as clock_time
+        clock_time.fromisoformat(value)
+        return value
+
+
 class HistoryPatch(Body):
-    counts: dict[str, Annotated[int, Field(strict=True, ge=0, le=1000)]]
+    counts: SalesCounts
     restricted: bool
-    windows: list[dict] | None = Field(default=None, max_length=48)
+    windows: list[HistoryWindow] | None = Field(default=None, max_length=48)
 
     @field_validator('windows')
     @classmethod
     def valid_windows(cls, value):
-        from datetime import time as clock_time
         seen = set()
         for window in value or []:
-            if set(window) != {'start_time', 'counts'} or window['start_time'] in seen:
+            if window.start_time in seen:
                 raise ValueError('Unique start_time/counts required')
-            clock_time.fromisoformat(window['start_time'])
-            seen.add(window['start_time'])
-            if not isinstance(window['counts'], dict) or any(type(c) is not int or not 0 <= c <= 1000 for c in window['counts'].values()):
-                raise ValueError('Counts must be integer quantities')
+            seen.add(window.start_time)
         return value
 
 
@@ -163,6 +174,8 @@ def fingerprint(command, body):
 
 
 def create_app(db_path: str | Path | None = None, *, repository=None, identities=None) -> FastAPI:
+    from .settings import agent_timeout_seconds, load_env
+    load_env()
     production = os.getenv("SHIFTPATCH_ENV") == "production" or bool(os.getenv("K_SERVICE"))
     app = FastAPI(title="ShiftPatch API", version="0.2.0")
     path = db_path or os.getenv("SHIFTPATCH_DB_PATH", str(Path(__file__).resolve().parents[2] / "data" / "shiftpatch.db"))
@@ -336,6 +349,10 @@ def create_app(db_path: str | Path | None = None, *, repository=None, identities
 
     @app.post("/api/stores/{store_id}/proposals")
     async def proposal(store_id: str, body: ProposalBody, idempotency_key: IdempotencyKey, request: Request, scoped_repository=Depends(store_repository)):
+        try:
+            time_budget = agent_timeout_seconds()
+        except ValueError as error:
+            raise DomainError('invalid_ai_configuration', str(error), 503) from None
         digest = fingerprint("proposals", body.model_dump())
         run_id = str(uuid4())
         started = datetime.now(timezone.utc)
@@ -344,6 +361,11 @@ def create_app(db_path: str | Path | None = None, *, repository=None, identities
             prior = state['idempotency'].get(idempotency_key)
             if prior and prior['digest'] != digest:
                 raise DomainError('idempotency_conflict', '同じキーの入力が異なります。')
+            if prior:
+                cached = ops.get(state['proposals'], prior['result']['proposal_id'], '提案')
+                if cached['status'] == 'ready' and not ops.proposal_current(cached, state):
+                    cached['status'] = 'stale'
+                return {'cached': deepcopy(cached)}
             for old_run in state['agent_runs'].values():
                 if old_run['key'] == idempotency_key and old_run['digest'] != digest:
                     raise DomainError('idempotency_conflict', '同じキーの入力が異なります。')
@@ -369,13 +391,25 @@ def create_app(db_path: str | Path | None = None, *, repository=None, identities
                 if not incident:
                     raise DomainError('invalid_incident', '有効な事件ではありません。', 422)
             context = body.model_dump()
+            context['service_date'] = target
             if body.parent_run_id:
                 parent = state['agent_runs'].get(body.parent_run_id)
                 if not parent or not parent.get('proposal_id'):
                     raise DomainError('invalid_parent', '前の実行が見つかりません。', 422)
                 old = ops.get(state['proposals'], parent['proposal_id'], '提案')
-                if old['mode'] != body.mode:
-                    raise DomainError('invalid_parent', '同じ分析モードで続けてください。', 422)
+                waiting = old['status'] == 'waiting_input'
+                retrying = old['status'] in {'failed', 'stale'} or (old['status'] == 'ready' and not ops.proposal_current(old, state))
+                if old['mode'] != body.mode or not (waiting or retrying):
+                    raise DomainError('invalid_parent', '確認待ち・失敗・期限切れの同じ分析モードで続けてください。', 422)
+                if retrying and body.answers:
+                    raise DomainError('invalid_answer', '失敗・期限切れの再分析には回答を指定できません。', 422)
+                old_target = old.get('service_date')
+                if not old_target:
+                    old_day = old.get('snapshot', {}).get('store', {}).get('service_date')
+                    if old_day:
+                        old_target = (date.fromisoformat(old_day) + timedelta(days=1 if body.mode == 'post_close' else 0)).isoformat()
+                if old_target and old_target != target:
+                    raise DomainError('invalid_parent', '同じ対象営業日の分析で続けてください。', 422)
                 questions = {q['id']: q for q in old.get('questions', []) if isinstance(q, dict)}
                 for qid, answer in body.answers.items():
                     q = questions.get(qid)
@@ -392,26 +426,34 @@ def create_app(db_path: str | Path | None = None, *, repository=None, identities
                             context['constraints']['allow_menu_pause'] = answer == 'true'
                         else:
                             context['constraints']['allowed_review_minutes'] = [int(answer)]
-                    elif answer != 'updated' or state['revision'] == old['revision']:
-                        raise DomainError('facts_not_updated', '勤務・在庫などを運営画面で先に保存してください。', 422)
+                    else:
+                        state_field = 'closes' if field == 'close' else field
+                        old_snapshot = old.get('snapshot', {})
+                        if state_field in old_snapshot:
+                            previous, current = deepcopy(old_snapshot[state_field]), deepcopy(state.get(state_field))
+                            if field == 'inventory':
+                                from .inventory import ensure
+                                # A legacy lot migration is not a manager's
+                                # stock correction and must not answer a fact.
+                                for rows in (previous, current):
+                                    for row in rows:
+                                        ensure(row, old_snapshot['business_now'])
+                            changed = current != previous
+                        else:
+                            changed = state['revision'] != old['revision']
+                        if answer != 'updated' or not changed:
+                            raise DomainError('facts_not_updated', '質問対象の勤務・在庫などを運営画面で先に保存してください。', 422)
                 if 'objective' not in body.model_fields_set and not any(questions[qid]['field'] == 'objective' for qid in body.answers):
                     context['objective'] = old.get('objective', 'balanced')
                 if 'constraints' not in body.model_fields_set:
                     inherited = deepcopy(old.get('constraints', context['constraints']))
                     inherited.update({k: v for k, v in context['constraints'].items() if any(questions[qid]['field'] == ('review_after_minutes' if k == 'allowed_review_minutes' else k) for qid in body.answers)})
                     context['constraints'] = inherited
+                if 'locale' not in body.model_fields_set:
+                    context['locale'] = old.get('locale', body.locale)
                 context['parent_summary'] = old['summary']
             elif body.answers:
                 raise DomainError('invalid_answer', '回答には前の実行IDが必要です。', 422)
-            prior = state["idempotency"].get(idempotency_key)
-            if prior:
-                if prior["digest"] != digest:
-                    raise DomainError("idempotency_conflict", "同じキーの入力が異なります。")
-                result_id = prior["result"]["proposal_id"]
-                cached = ops.get(state["proposals"], result_id, "提案")
-                if cached["status"] == "ready" and not ops.proposal_current(cached, state):
-                    cached["status"] = "stale"
-                return {"cached": deepcopy(cached)}
             for entry in state["agent_runs"].values():
                 if entry["key"] == idempotency_key:
                     if entry["digest"] != digest:
@@ -426,7 +468,7 @@ def create_app(db_path: str | Path | None = None, *, repository=None, identities
             state['agent_runs'][run_id] = {'id': run_id, 'key': idempotency_key, 'digest': digest, 'status': 'running',
                 'phase': 'snapshot', 'trace': [], 'started_at': iso(started), 'revision': state['revision'],
                 'parent_run_id': body.parent_run_id, 'trigger_event_id': body.trigger_event_id,
-                'expires_at': iso(started+timedelta(seconds=40))}
+                'expires_at': iso(started+timedelta(seconds=time_budget))}
             if body.mode == 'in_service' and state.get('replan_required'):
                 covered = state.get('replan_event') or {}
                 state['agent_runs'][run_id]['covered_event_id'] = covered.get('id')
@@ -459,8 +501,11 @@ def create_app(db_path: str | Path | None = None, *, repository=None, identities
                     raise DomainError("rate_limited", "運営案の計算回数が上限に達しました。時間をおいて再実行してください。", 429)
         except Exception:
             def deny(state):
-                if run_id in state["agent_runs"]:
-                    state["agent_runs"][run_id]["status"] = "interrupted"
+                # A rejected quota check has not started an agent execution. Do
+                # not consume the incident or reserve its request key forever.
+                denied = state["agent_runs"].pop(run_id, None)
+                if denied and denied.get('covered_event_id') and denied['covered_event_id'] == (state.get('replan_event') or {}).get('id'):
+                    state['replan_required'] = True
             scoped_repository.transact(deny)
             raise
         from .agent.runner import generate_proposal
@@ -483,7 +528,7 @@ def create_app(db_path: str | Path | None = None, *, repository=None, identities
             scoped_repository.transact(save_progress)
             last_progress[:] = [phase, len(trace), time.monotonic()]
         try:
-            async with asyncio.timeout(39):
+            async with asyncio.timeout(time_budget - 1):
                 import inspect
                 kwargs = {'progress': progress} if 'progress' in inspect.signature(generate_proposal).parameters else {}
                 result = await generate_proposal(snapshot, body.mode, snapshot['request_context']['objective'], **kwargs)
@@ -493,7 +538,7 @@ def create_app(db_path: str | Path | None = None, *, repository=None, identities
             logger.exception("Proposal generation failed: %s", run_id)
             result = {"status": "failed", "error": "提案の生成に失敗しました。入力または接続設定を確認してください。", "summary": "生成失敗", "source": os.getenv("SHIFTPATCH_AI_MODE", "calculation_only"), "candidates": [], "trace": []}
         proposal_id = str(uuid4())
-        result.update(id=proposal_id, run_id=run_id, parent_run_id=body.parent_run_id, trigger_event_id=body.trigger_event_id, constraints=snapshot["request_context"]["constraints"], locale=body.locale, mode=body.mode, type={"pre_open": "prep_plan", "in_service": "service_plan", "post_close": "next_day_plan"}[body.mode],
+        result.update(id=proposal_id, run_id=run_id, parent_run_id=body.parent_run_id, trigger_event_id=body.trigger_event_id, service_date=snapshot['request_context']['service_date'], constraints=snapshot["request_context"]["constraints"], locale=snapshot['request_context']['locale'], mode=body.mode, type={"pre_open": "prep_plan", "in_service": "service_plan", "post_close": "next_day_plan"}[body.mode],
                       revision=snapshot["revision"], created_at=snapshot["business_now"], snapshot_id=snapshot["snapshot_id"])
         result.setdefault("recommended_candidate_id", None)
         result.setdefault("review_at", iso(parse_time(snapshot["business_now"])+timedelta(minutes=30)))
@@ -512,6 +557,8 @@ def create_app(db_path: str | Path | None = None, *, repository=None, identities
             if execution.get('cancel_requested'):
                 result.update(status='failed', error='interrupted', recommended_candidate_id=None, summary='分析を中断しました。')
             execution['status'] = ('interrupted' if result.get('error') == 'interrupted' else 'timed_out' if result.get('error') == 'budget_exceeded' else 'succeeded' if result['status'] == 'ready' else result['status'])
+            if result['status'] == 'failed' and not result.get('trace'):
+                result['trace'] = deepcopy(execution.get('trace', []))
             execution.update(phase=result.get('phase', execution.get('phase', 'snapshot')), trace=deepcopy(result.get('trace', [])), finished_at=iso(datetime.now(timezone.utc)))
             execution["proposal_id"] = proposal_id
             state["proposals"].insert(0, deepcopy(result))
@@ -567,7 +614,8 @@ def create_app(db_path: str | Path | None = None, *, repository=None, identities
 
     @app.patch("/api/stores/{store_id}/history/{business_date}")
     def history(store_id: str, business_date: str, body: HistoryPatch, idempotency_key: IdempotencyKey, request: Request, scoped_repository=Depends(store_repository)):
-        mutate(scoped_repository, idempotency_key, f"history/{business_date}", body.model_dump(), lambda s: ops.update_history(s, business_date, body.counts, body.restricted, body.windows))
+        values = body.model_dump()
+        mutate(scoped_repository, idempotency_key, f"history/{business_date}", values, lambda s: ops.update_history(s, business_date, body.counts, body.restricted, values['windows']))
         return present(scoped_repository, request)
 
     @app.post('/api/stores/{store_id}/clock')
