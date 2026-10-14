@@ -141,6 +141,7 @@ export interface Proposal {
     "ready" | "stale" | "applied" | "acknowledged" | "failed" | "waiting_input" | "dismissed";
   revision: number;
   source: "gemini" | "calculation_only";
+  objective?: Objective;
   created_at: string;
   review_at: string | null;
   recommended_candidate_id: string | null;
@@ -161,6 +162,7 @@ export interface Proposal {
   elapsed_ms?: number;
   questions?: (AgentQuestion | string)[];
   error?: string;
+  snapshot?: Partial<Pick<Overview, "store" | "business_now" | "revision" | "staff" | "next_day_staff" | "inventory" | "history" | "closes">>;
 }
 
 export interface AgentQuestion {
@@ -170,6 +172,7 @@ export interface AgentQuestion {
   options: string[];
 }
 export interface GenerateOptions {
+  objective?: Objective;
   trigger_event_id?: string;
   parent_run_id?: string;
   answers?: Record<string, string>;
@@ -201,7 +204,7 @@ export interface CloseRecord {
 }
 
 export interface Overview {
-  store: { id: string; name: string; service_date: string };
+  store: { id: string; name: string; service_date: string; open_time?: string; close_time?: string; timezone?: string };
   business_now: string;
   clock?: { mode: "manual" | "realtime" };
   revision: number;

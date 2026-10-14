@@ -39,6 +39,7 @@ import {
 import { ApiError, request } from "./api";
 import SessionGate from "./SessionGate";
 import { AgentProgress, AgentQuestions } from "./AgentPanel";
+import { analysisBlockReason, continuedProposal, entryAnalysisMode, pendingQuestionProposal, questionFactUpdated } from "./agentWorkflow";
 import type {
   AuthenticatedSession,
   AgentQuestion,
@@ -226,6 +227,8 @@ function Workspace({
   const [activeProposal, setActiveProposal] = useState<Proposal | null>(null);
   const [generating, setGenerating] = useState(false);
   const [autoAnalyze, setAutoAnalyze] = useState(true);
+  const [questionAnswers, setQuestionAnswers] = useState<Record<string, Record<string, string>>>({});
+  const [shiftsNextDay, setShiftsNextDay] = useState(false);
   const autoSeen = useRef(new Set<string>());
   const { data, error, isPending, refetch } = useQuery({
     queryKey: ["overview", session.store.id],
@@ -233,7 +236,8 @@ function Workspace({
       request<Overview>("/overview", "GET", undefined, signal),
     refetchInterval: generating ? 1000 : 4000,
   });
-  const waitingProposal = data?.proposals.find(p => p.status === 'waiting_input' && !data.proposals.some(child => child.parent_run_id === p.run_id));
+  const waitingProposal = data && pendingQuestionProposal(data.proposals);
+  const running = data?.active_run?.status === "running";
   const demo = window.location.pathname.startsWith("/demo/order");
   useEffect(() => {
     if (
@@ -288,22 +292,29 @@ function Workspace({
     return () => window.clearTimeout(timer);
   }, [notice]);
   useEffect(() => {
-    if (demo || !autoAnalyze || busy || sessionBusy || generating || waitingProposal || !data?.replan_required || !data.replan_event || data.active_run?.status === 'running') return;
+    if (demo || !autoAnalyze || busy || sessionBusy || generating || waitingProposal || !data?.replan_required || !data.replan_event || running || analysisBlockReason(data, "in_service")) return;
     const id = data.replan_event.id;
     if (autoSeen.current.has(id)) return;
     autoSeen.current.add(id);
     void generate('in_service', { trigger_event_id: id });
-  }, [data, autoAnalyze, busy, sessionBusy, generating, demo, waitingProposal]);
+  }, [data, autoAnalyze, busy, sessionBusy, generating, demo, waitingProposal, running]);
   async function generate(mode: ProposalMode, options: GenerateOptions = {}) {
-    if (busy || sessionBusy || generating) return;
+    if (busy || sessionBusy || generating || running) return;
+    if (data) {
+      const reason = analysisBlockReason(data, mode);
+      if (reason) { setNotice({ text: reason, error: true }); return; }
+    }
     setGenerating(true);
-    const result = await act<Proposal>("/proposals", "POST", {
-      mode,
-      objective,
-      ...options,
-    });
-    if (result) setActiveProposal(result);
-    setGenerating(false);
+    try {
+      const result = await act<Proposal>("/proposals", "POST", {
+        mode,
+        ...(!options.parent_run_id ? { objective } : {}),
+        ...options,
+      });
+      if (result) setActiveProposal(result);
+    } finally {
+      setGenerating(false);
+    }
   }
   const header = (
     <div className="wordmark">
@@ -347,7 +358,7 @@ function Workspace({
     act,
     busy: Boolean(busy) || sessionBusy,
     generate,
-    generating,
+    generating: generating || running,
     objective,
     setObjective,
   };
@@ -569,8 +580,9 @@ function Workspace({
           </div>
           {!demo && <section className="ai-entry-bar">
             <div><strong><Sparkles size={16}/> {data.config.agent_mode === 'gemini' ? 'AI運営アシスタント' : '運営アシスタント · 計算モード'}</strong><p>{data.replan_event?.message || '今日の勤務・在庫・注文を調べ、運営候補を比較します。'}</p></div>
-            <label className="agent-auto"><input type="checkbox" checked={autoAnalyze} onChange={e => setAutoAnalyze(e.target.checked)}/> 事件発生時に自動分析</label>
-            <GenerateButton {...props} mode={screen === 'prep' ? 'pre_open' : screen === 'close' ? 'post_close' : 'in_service'}>{data.config.agent_mode === 'gemini' ? 'AIで分析する' : '条件を計算する'}</GenerateButton>
+            <label className="agent-auto"><input type="checkbox" checked={autoAnalyze} onChange={e => setAutoAnalyze(e.target.checked)}/> 営業中の変化を自動{data.config.agent_mode === 'gemini' ? '分析' : '計算'}</label>
+            <GenerateButton {...props} mode={entryAnalysisMode(data, screen)}>{data.config.agent_mode === 'gemini' ? 'AIで分析する' : '条件を計算する'}</GenerateButton>
+            {analysisBlockReason(data, entryAnalysisMode(data, screen)) && <p className="field-help">{analysisBlockReason(data, entryAnalysisMode(data, screen))}</p>}
           </section>}
           {!demo && waitingProposal && !generating && <div className="alert"><CircleHelp size={17}/><span>分析に確認事項があります。運営データを修正した後、回答して続けられます。</span><button className="text-button" onClick={() => setActiveProposal(waitingProposal)}>確認・回答する</button></div>}
           {!demo && data.active_run?.status === 'running' && <AgentProgress run={data.active_run} onCancel={async () => {
@@ -589,7 +601,7 @@ function Workspace({
           ) : screen === "service" ? (
             <Service {...props} onProposal={setActiveProposal} />
           ) : screen === "shifts" ? (
-            <Shifts {...props} />
+            <Shifts {...props} nextDay={shiftsNextDay} onDayChange={setShiftsNextDay} />
           ) : screen === "prep" ? (
             <Preparation {...props} onProposal={setActiveProposal} />
           ) : (
@@ -635,10 +647,14 @@ function Workspace({
           }
           data={data}
           act={act}
-          busy={!!busy || sessionBusy}
+          busy={!!busy || sessionBusy || running}
           onClose={() => setActiveProposal(null)}
-          onContinue={async answers => { const p = activeProposal; if (p?.run_id) { setActiveProposal(null); await generate(p.mode, { parent_run_id: p.run_id, answers }); } }}
-          onEdit={field => { setActiveProposal(null); setScreen(field === 'inventory' ? 'prep' : field === 'close' || field === 'history' ? 'close' : 'shifts'); window.scrollTo({ top: 0 }); }}
+          answers={questionAnswers[activeProposal.id] || {}}
+          onAnswersChange={answers => setQuestionAnswers(previous => ({ ...previous, [activeProposal.id]: answers }))}
+          onContinue={async answers => { const p = activeProposal; if (p?.run_id) await generate(p.mode, { parent_run_id: p.run_id, answers }); }}
+          onRetry={async () => { await generate(activeProposal.mode, { parent_run_id: activeProposal.run_id, objective: activeProposal.objective || objective }); }}
+          onOpenProposal={setActiveProposal}
+          onEdit={field => { setActiveProposal(null); setShiftsNextDay(field === 'next_day_staff'); setScreen(field === 'inventory' ? 'prep' : field === 'close' || field === 'history' ? 'close' : 'shifts'); window.scrollTo({ top: 0 }); }}
         />
       )}
       {resetOpen && (
@@ -667,6 +683,8 @@ function Workspace({
                 ) {
                   setResetOpen(false);
                   setActiveProposal(null);
+                  setQuestionAnswers({});
+                  autoSeen.current.clear();
                 }
               }}
             >
@@ -693,15 +711,17 @@ function GenerateButton({
   generate,
   generating,
   busy,
+  data,
   children,
-}: Pick<CommonProps, "generate" | "generating" | "busy"> & {
+}: Pick<CommonProps, "generate" | "generating" | "busy" | "data"> & {
   mode: ProposalMode;
   children?: ReactNode;
 }) {
   return (
     <button
       className="button primary"
-      disabled={busy || generating}
+      disabled={busy || generating || Boolean(analysisBlockReason(data, mode))}
+      title={analysisBlockReason(data, mode) || undefined}
       onClick={() => generate(mode)}
     >
       {generating ? (
@@ -709,7 +729,7 @@ function GenerateButton({
       ) : (
         <Sparkles size={16} />
       )}
-      {generating ? "計算中…" : children || "運営案を計算"}
+      {generating ? (data.config.agent_mode === "gemini" ? "分析中…" : "計算中…") : children || (data.config.agent_mode === "gemini" ? "AIで運営案を分析" : "運営案を計算")}
     </button>
   );
 }
@@ -944,7 +964,7 @@ function Service(
                   <Sparkles size={20} />
                 </span>
                 <div>
-                  <h2>AI運営アシスタント</h2>
+                  <h2>{data.config.agent_mode === "gemini" ? "AI運営アシスタント" : "運営アシスタント"}</h2>
                   <p>人員・在庫・注文をもとに30分先を比較</p>
                 </div>
               </div>
@@ -1262,13 +1282,13 @@ function TaskRow({
   );
 }
 
-function Shifts(props: CommonProps) {
+function Shifts(props: CommonProps & { nextDay: boolean; onDayChange: (nextDay: boolean) => void }) {
   const { data, act, busy } = props;
   const [editing, setEditing] = useState<{
     staff: Staff;
     next: boolean;
   } | null>(null);
-  const [nextDay, setNextDay] = useState(false);
+  const { nextDay, onDayChange: setNextDay } = props;
   const list = nextDay ? data.next_day_staff || [] : data.staff;
   return (
     <>
@@ -2237,6 +2257,10 @@ function ProposalModal({
   onClose,
   onContinue,
   onEdit,
+  answers,
+  onAnswersChange,
+  onRetry,
+  onOpenProposal,
 }: {
   proposal: Proposal;
   data: Overview;
@@ -2245,6 +2269,10 @@ function ProposalModal({
   onClose: () => void;
   onContinue: (answers: Record<string, string>) => Promise<void>;
   onEdit: (field: string) => void;
+  answers: Record<string, string>;
+  onAnswersChange: (answers: Record<string, string>) => void;
+  onRetry: () => Promise<void>;
+  onOpenProposal: (proposal: Proposal) => void;
 }) {
   const [selected, setSelected] = useState(
     proposal.recommended_candidate_id ||
@@ -2257,6 +2285,9 @@ function ProposalModal({
   const stale =
     proposal.status === "stale" ||
     (proposal.status === "ready" && proposal.revision !== data.revision);
+  const retryBlocked = analysisBlockReason(data, proposal.mode);
+  const structuredQuestions = (proposal.questions || []).filter((q): q is AgentQuestion => typeof q !== "string");
+  const continuation = continuedProposal(proposal, data.proposals);
   return (
     <Modal
       title={
@@ -2282,13 +2313,15 @@ function ProposalModal({
       {stale && (
         <div className="alert warning">
           <AlertTriangle size={16} />
-          作成後にお店の状態が変わりました。営業画面から再計算してください。
+          作成後にお店の状態が変わりました。最新の条件で再分析してください。
         </div>
       )}
-      {proposal.error && <div className="alert warning">{proposal.error}</div>}
+      {proposal.error && <div className="alert warning">{({ budget_exceeded: "分析の制限時間に達しました。最新の条件で再試行できます。", interrupted: "分析を中断しました。必要なときに再開できます。", model_unavailable: "Geminiへの接続を確認して再試行してください。", agent_failed: "分析結果を検証できませんでした。再試行するか、店舗データを確認してください。", calculation_failed: "店舗データを確認して再計算してください。" } as Record<string, string>)[proposal.error] || proposal.error}</div>}
       {proposal.questions?.filter((q): q is string => typeof q === 'string').map(question => <div className="alert" key={question}>{question}</div>)}
-      {proposal.status === 'waiting_input' && proposal.questions?.some(q => typeof q !== 'string') && <AgentQuestions key={proposal.id} questions={proposal.questions.filter((q): q is AgentQuestion => typeof q !== 'string')} busy={busy} onContinue={onContinue} onEdit={onEdit}/>}
-      <p className="field-help">{proposal.model_id ? `モデル: ${proposal.model_id} · ` : ''}{proposal.model_calls ?? 0} 回のモデル呼出し · {((proposal.elapsed_ms ?? 0)/1000).toFixed(1)}秒{proposal.parent_run_id ? ' · 前の確認回答から続行' : ''}</p>
+      {proposal.status === 'waiting_input' && structuredQuestions.length > 0 && !continuation && <AgentQuestions key={proposal.id} questions={structuredQuestions} answers={answers} onAnswersChange={onAnswersChange} factsUpdated={Object.fromEntries(structuredQuestions.map(question => [question.id, questionFactUpdated(data, proposal, question.field)]))} busy={busy || Boolean(retryBlocked)} onContinue={onContinue} onEdit={onEdit}/>}
+      {continuation && proposal.status === "waiting_input" && <div className="alert"><span>この確認事項への回答から新しい分析が作成されています。</span><button className="text-button" onClick={() => onOpenProposal(continuation)}>分析結果を確認</button></div>}
+      {retryBlocked && <p className="field-help">{retryBlocked}</p>}
+      <p className="field-help">{proposal.source === "gemini" ? `${proposal.model_id ? `モデル: ${proposal.model_id} · ` : ''}${proposal.model_calls ?? 0} 回のモデル呼出し` : 'サーバーによる計算 · AI未使用'} · {((proposal.elapsed_ms ?? 0)/1000).toFixed(1)}秒{proposal.parent_run_id ? ' · 前の分析から続行' : ''}</p>
       {proposal.candidates.length > 0 && (
         <>
           <div className="comparison-label">
@@ -2410,6 +2443,7 @@ function ProposalModal({
           閉じる
         </button>
         {!['applied', 'acknowledged', 'dismissed'].includes(proposal.status) && <button className="button" disabled={busy} onClick={async () => { if (await act(`/proposals/${proposal.id}/dismiss`, 'POST', {})) onClose(); }}>この提案を見送る</button>}
+        {(proposal.status === "failed" || stale || (proposal.status === "waiting_input" && structuredQuestions.length === 0)) && <button className="button primary" disabled={busy || Boolean(retryBlocked)} onClick={onRetry}><RefreshCw size={16}/>{proposal.source === "gemini" ? "最新の条件で再分析" : "最新の条件で再計算"}</button>}
         {canApply && (
           <button
             className="button primary"

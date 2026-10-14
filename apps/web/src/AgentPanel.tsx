@@ -14,14 +14,16 @@ export function AgentProgress({ run, onCancel }: { run: AgentRun; onCancel: () =
   </section>;
 }
 const preferenceLabels: Record<string, string> = { balanced: "売上と待ち時間のバランス", preserve_drinks: "ドリンク販売を優先", reduce_delay: "待ち時間を優先", true: "販売停止を許可", false: "販売停止を許可しない", "15": "15分後", "30": "30分後" };
-export function AgentQuestions({ questions, busy, onContinue, onEdit }: { questions: AgentQuestion[]; busy: boolean; onContinue: (answers: Record<string, string>) => Promise<void>; onEdit: (field: string) => void }) {
-  const [answers, setAnswers] = useState<Record<string, string>>({});
+export function AgentQuestions({ questions, answers, onAnswersChange, factsUpdated, busy, onContinue, onEdit }: { questions: AgentQuestion[]; answers: Record<string, string>; onAnswersChange: (answers: Record<string, string>) => void; factsUpdated: Record<string, boolean>; busy: boolean; onContinue: (answers: Record<string, string>) => Promise<void>; onEdit: (field: string) => void }) {
+  const [submitting, setSubmitting] = useState(false);
   const defaults: Record<string, string[]> = { objective: ["balanced", "preserve_drinks", "reduce_delay"], allow_menu_pause: ["true", "false"], review_after_minutes: ["15", "30"] };
-  return <form className="agent-questions" onSubmit={async e => { e.preventDefault(); await onContinue(answers); }}>
+  const blocked = busy || submitting;
+  const missingAnswer = questions.some(q => !answers[q.id] || (!defaults[q.field] && !factsUpdated[q.id]));
+  return <form className="agent-questions" onSubmit={async e => { e.preventDefault(); if (blocked || missingAnswer) return; setSubmitting(true); try { await onContinue(answers); } finally { setSubmitting(false); } }}>
     <h3><Sparkles size={17}/> 確認して分析を続ける</h3>
     {questions.map(q => <div className="form-label" key={q.id}><label htmlFor={`agent-answer-${q.id}`}>{q.text}</label>
-      {defaults[q.field] ? <select id={`agent-answer-${q.id}`} required value={answers[q.id] || ""} onChange={e => setAnswers({ ...answers, [q.id]: e.target.value })}><option value="">選択してください</option>{(q.options.length ? q.options : defaults[q.field]).map(value => <option key={value} value={value}>{preferenceLabels[value] || value}</option>)}</select> : <><p className="field-help">店舗の事実は運営画面で先に保存してください。チャットの回答だけでは在庫や勤務を変更しません。</p><button type="button" className="button" onClick={() => onEdit(q.field)}>該当する入力画面を開く</button><select id={`agent-answer-${q.id}`} required value={answers[q.id] || ""} onChange={e => setAnswers({ ...answers, [q.id]: e.target.value })}><option value="">保存後に選択</option><option value="updated">運営データを保存しました</option></select></>}
+      {defaults[q.field] ? <select id={`agent-answer-${q.id}`} disabled={blocked} required value={answers[q.id] || ""} onChange={e => onAnswersChange({ ...answers, [q.id]: e.target.value })}><option value="">選択してください</option>{(q.options.length ? q.options : defaults[q.field]).map(value => <option key={value} value={value}>{preferenceLabels[value] || value}</option>)}</select> : <><p className="field-help">該当する運営データを保存してから、この確認画面に戻ってください。{!factsUpdated[q.id] && "まだ質問対象のデータの変更が保存されていません。"}</p><button type="button" className="button" disabled={blocked} onClick={() => onEdit(q.field)}>該当する入力画面を開く</button><select id={`agent-answer-${q.id}`} disabled={blocked || !factsUpdated[q.id]} required value={answers[q.id] || ""} onChange={e => onAnswersChange({ ...answers, [q.id]: e.target.value })}><option value="">保存後に選択</option><option value="updated">運営データを保存しました</option></select></>}
     </div>)}
-    <button className="button primary" disabled={busy || questions.some(q => !answers[q.id])}>回答して新しい条件で分析</button>
+    <button className="button primary" disabled={blocked || missingAnswer}>{blocked ? <LoaderCircle size={16} className="spin"/> : <Sparkles size={16}/>} {blocked ? "回答から分析しています…" : "回答して新しい条件で分析"}</button>
   </form>;
 }
