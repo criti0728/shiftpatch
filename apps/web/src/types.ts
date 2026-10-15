@@ -73,6 +73,7 @@ export interface Task {
   started_at: string | null;
   duration_seconds: number | null;
   allocations: Record<string, number>;
+  lot_allocations?: Record<string, { lot_id: string; quantity: number }[]>;
 }
 
 export interface Order {

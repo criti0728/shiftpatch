@@ -39,6 +39,7 @@ import {
 import { ApiError, request } from "./api";
 import SessionGate from "./SessionGate";
 import { AgentProgress, AgentQuestions } from "./AgentPanel";
+import { taskNeedsReallocation } from "./inventoryWorkflow";
 import { analysisBlockReason, continuedProposal, entryAnalysisMode, pendingQuestionProposal, questionFactUpdated } from "./agentWorkflow";
 import type {
   AuthenticatedSession,
@@ -1192,6 +1193,9 @@ function TaskRow({
   const selected = eligible.some((s) => s.id === staffId)
     ? staffId
     : eligible[0]?.id || "";
+  const selectedDuration = eligible.find(person => person.id === selected)?.skills[task.menu_id] || 0;
+  const reservationIssue = taskNeedsReallocation(task, data.inventory,
+    new Date(new Date(data.business_now).getTime() + selectedDuration * 1000).toISOString());
   const readyAt =
     task.started_at && task.duration_seconds != null
       ? new Date(
@@ -1225,7 +1229,7 @@ function TaskRow({
       </div>
       {task.status === "accepted" ? (
         <div className="task-actions">
-          {Object.keys(task.allocations).some(id => { const entry = data.inventory.find(v => v.id === id); return entry && (entry.on_hand < entry.reserved || new Date(entry.expires_at) <= new Date(data.business_now)); }) && <button className="button small" disabled={busy} aria-label={`${taskLabel}の材料を再確保`} onClick={() => act(`/orders/${orderId}/tasks/${task.id}/reallocate`, 'POST', {}, '有効な材料を再確保しました。')}>材料を再確保</button>}
+          {reservationIssue && <button className="button small" disabled={busy || !eligible.length} title="予約ロットが不足、または提供予定時刻までに期限切れです。有効な入荷ロットを確認してください。" aria-label={`${taskLabel}の材料を再確保`} onClick={() => act(`/orders/${orderId}/tasks/${task.id}/reallocate`, 'POST', {}, '有効な材料を再確保しました。')}>材料を再確保</button>}
           <select
             aria-label={`${taskLabel}の担当スタッフ`}
             value={selected}
