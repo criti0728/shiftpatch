@@ -49,9 +49,12 @@ def _api_error(status: int | None) -> GeminiProviderError:
         401: ('model_authentication_failed', 'Gemini認証が無効です。APIキー、または gcloud auth application-default login の認証を更新してください。'),
         403: ('model_permission_denied', 'Geminiへのアクセスが拒否されました。認証アカウント・プロジェクトの Vertex AI 権限・APIの有効化・キーの制限を確認してください。'),
         404: ('model_not_found', '指定したGeminiモデルまたは接続先が見つかりません。モデルID・リジョン・APIのベースURLを確認してください。'),
+        408: ('model_timeout', 'Geminiの応答がリクエストの制限時間に達しました。しばらく待って再実行してください。'),
         429: ('model_rate_limited', 'Geminiの利用制限に達しました。プロジェクトのクォータ・課金・クレジット残高を確認して再実行してください。'),
+        504: ('model_timeout', 'Geminiの応答がリクエストの制限時間に達しました。しばらく待って再実行してください。'),
     }
-    code, message = diagnostics.get(status, ('model_unavailable', 'Geminiサービスに接続できません。接続先とサービスの状態を確認して再実行してください。'))
+    fallback = ('model_service_unavailable', 'Geminiサービスで一時的なエラーが発生しました。しばらく待って再実行してください。') if status and status >= 500 else ('model_unavailable', 'Geminiサービスに接続できません。接続先とサービスの状態を確認して再実行してください。')
+    code, message = diagnostics.get(status, fallback)
     return GeminiProviderError(code, message, http_status=status,
                                retryable=status in (408, 429) or bool(status and status >= 500))
 
@@ -69,7 +72,10 @@ class GeminiTransport:
         self.last_usage = {}
         options = types.HttpOptions(
             api_version=settings.api_version,
-            base_url=settings.endpoint or None, timeout=30_000,
+            # The SDK also sends this as X-Server-Timeout in seconds. Keeping a
+            # fixed 30s value imposed a server deadline on longer tool turns,
+            # even when the surrounding agent still had time available.
+            base_url=settings.endpoint or None, timeout=int(settings.request_timeout_seconds * 1000),
             retry_options=types.HttpRetryOptions(attempts=1),
         )
         # Select both paths explicitly: SDK environment flags must not reroute a
@@ -85,7 +91,7 @@ class GeminiTransport:
         from google.auth.exceptions import DefaultCredentialsError, RefreshError, TransportError
         from google.genai import types
         from google.genai.errors import APIError
-        from httpx import RequestError
+        from httpx import RequestError, TimeoutException
         self.last_usage = {}
         try:
             response = await self.client.aio.models.generate_content(
@@ -112,6 +118,11 @@ class GeminiTransport:
             raise GeminiProviderError(
                 'model_authentication_failed',
                 'GCP認証を利用できません。gcloud auth application-default login を実行するか、実行サービスの認証を確認してください。',
+            ) from exc
+        except (TimeoutException, TimeoutError) as exc:
+            raise GeminiProviderError(
+                'model_timeout', 'Geminiの応答がリクエストの制限時間に達しました。しばらく待って再実行してください。',
+                retryable=True,
             ) from exc
         except (TransportError, RequestError) as exc:
             raise GeminiProviderError(

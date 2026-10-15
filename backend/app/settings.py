@@ -23,6 +23,18 @@ def agent_timeout_seconds(default: float = 40) -> float:
     return value
 
 
+def gemini_request_timeout_seconds(default: float = 60) -> float:
+    """Bound each SDK request independently of the entire agent execution."""
+    raw = os.getenv("SHIFTPATCH_GEMINI_REQUEST_TIMEOUT_SECONDS")
+    try:
+        value = default if raw is None else float(raw)
+    except ValueError:
+        raise ValueError("SHIFTPATCH_GEMINI_REQUEST_TIMEOUT_SECONDS は5〜120秒で指定してください。") from None
+    if not 5 <= value <= 120:
+        raise ValueError("SHIFTPATCH_GEMINI_REQUEST_TIMEOUT_SECONDS は5〜120秒で指定してください。")
+    return value
+
+
 def load_env(path: str | Path | None = None) -> None:
     """Read .env without executing shell code; existing process values win."""
     source = Path(path) if path is not None else ROOT / ".env"
@@ -61,6 +73,7 @@ class GeminiSettings:
     location: str
     endpoint: str
     api_version: str
+    request_timeout_seconds: float = 60
 
     @classmethod
     def from_env(cls) -> "GeminiSettings":
@@ -90,7 +103,8 @@ class GeminiSettings:
         if not re.fullmatch(r"v[0-9]+(?:alpha|beta)?[0-9]*", version):
             raise ValueError("SHIFTPATCH_GEMINI_API_VERSION を確認してください。")
         return cls(mode, provider, model, key, project,
-                   os.getenv("GOOGLE_CLOUD_LOCATION", "global").strip() or "global", endpoint, version)
+                   os.getenv("GOOGLE_CLOUD_LOCATION", "global").strip() or "global", endpoint, version,
+                   gemini_request_timeout_seconds())
 
     def require_credentials(self) -> None:
         if self.provider == "developer" and not self.api_key:

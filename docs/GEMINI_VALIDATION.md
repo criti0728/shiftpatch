@@ -13,6 +13,7 @@ GOOGLE_CLOUD_PROJECT=your-project-id
 GOOGLE_CLOUD_LOCATION=global
 SHIFTPATCH_GEMINI_MODEL=gemini-3.8-flash
 SHIFTPATCH_AI_TIMEOUT_SECONDS=120
+SHIFTPATCH_GEMINI_REQUEST_TIMEOUT_SECONDS=60
 ```
 
 GCP Vertex 연결은 `gcloud auth application-default login`으로 인증한다. API 활성화와 해당 계정의 `roles/aiplatform.user` 권한, 프로젝트 결제 설정이 필요하다. Developer API 키를 사용하려면 provider를 `developer`로 바꾸고 `GEMINI_API_KEY`를 추가한다. GCP 프로젝트가 존재하는 `auto` 설정은 Vertex를 우선하므로 키가 있다고 임의로 Developer API로 전환하지 않는다.

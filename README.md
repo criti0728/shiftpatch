@@ -193,6 +193,7 @@ GOOGLE_CLOUD_PROJECT=your-project-id
 GOOGLE_CLOUD_LOCATION=global
 SHIFTPATCH_GEMINI_MODEL=gemini-3.8-flash
 SHIFTPATCH_AI_TIMEOUT_SECONDS=120
+SHIFTPATCH_GEMINI_REQUEST_TIMEOUT_SECONDS=60
 ```
 
 `your-project-id` は、表示名ではなく実際のプロジェクト ID に置き換えます。Vertex AI API の有効化、利用アカウントの `roles/aiplatform.user` 権限、プロジェクトの課金設定が必要です。クレジットの適用条件は、利用中の課金アカウントで確認してください。[Google Cloud の接続ガイド](https://cloud.google.com/vertex-ai/generative-ai/docs/start/quickstart)
@@ -224,6 +225,8 @@ SHIFTPATCH_GEMINI_MODEL=gemini-3.8-flash
 `.env` を変更した後は、開発サーバーを `Ctrl+C` で停止し、`python3 scripts/dev.py` で再起動します。画面上部の **AI運営アシスタント → AIで分析する** から実行できます。
 
 分析時間は `SHIFTPATCH_AI_TIMEOUT_SECONDS` で 10〜180 秒に設定できます。未指定時は 40 秒で、実モデルの複数段階の分析には 120 秒を推奨します。API の実行期限、モデル待機、結果保存は同じ時間枠で管理します。モデル呼び出し 6 回、ツール実行 12 回、候補 5 件の上限は、時間枠を延ばしても変わりません。
+
+各モデルリクエストの待機時間は `SHIFTPATCH_GEMINI_REQUEST_TIMEOUT_SECONDS` で 5〜120 秒に設定できます。初期値は 60 秒です。Vertex AI の HTTP 504 は、応答がリクエストの期限内に完了しなかったことを示します。認証が成功していても発生し、画面には接続・権限エラーと区別して表示します。リクエストの待機時間を延ばしても、分析全体の上限は維持されます。
 
 営業前・営業中・営業後の状態に応じて分析します。営業中の自動分析を有効にすると、欠勤、実在庫の変更、入荷差異、注文数・待ち時間のしきい値、見直し時刻などをきっかけに再分析します。自動リクエストは管理画面を開いている間に動作します。
 

@@ -2,7 +2,7 @@ import os
 
 import pytest
 
-from app.settings import GeminiSettings, agent_timeout_seconds, load_env
+from app.settings import GeminiSettings, agent_timeout_seconds, gemini_request_timeout_seconds, load_env
 
 
 @pytest.fixture(autouse=True)
@@ -11,7 +11,7 @@ def clean_settings(monkeypatch):
     for name in ("SHIFTPATCH_AI_MODE", "SHIFTPATCH_GEMINI_PROVIDER", "SHIFTPATCH_GEMINI_MODEL",
                  "GEMINI_MODEL", "GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_CLOUD_PROJECT",
                  "GOOGLE_CLOUD_LOCATION", "SHIFTPATCH_GEMINI_ENDPOINT", "SHIFTPATCH_GEMINI_API_VERSION",
-                 "SHIFTPATCH_AI_TIMEOUT_SECONDS"):
+                 "SHIFTPATCH_AI_TIMEOUT_SECONDS", "SHIFTPATCH_GEMINI_REQUEST_TIMEOUT_SECONDS"):
         monkeypatch.delenv(name, raising=False)
 
 
@@ -91,3 +91,27 @@ def test_agent_budget_configuration_and_default(monkeypatch):
     assert agent_timeout_seconds(default=0.03) == 0.03
     monkeypatch.setenv("SHIFTPATCH_AI_TIMEOUT_SECONDS", "120")
     assert agent_timeout_seconds() == 120
+
+
+@pytest.mark.parametrize("value", ["", "0", "4.99", "-5", "120.01", "inf", "nan", "secret-value"])
+def test_invalid_request_timeout_is_rejected_without_exposing_its_value(monkeypatch, value):
+    monkeypatch.setenv("SHIFTPATCH_GEMINI_REQUEST_TIMEOUT_SECONDS", value)
+    with pytest.raises(ValueError, match="SHIFTPATCH_GEMINI_REQUEST_TIMEOUT_SECONDS") as error:
+        GeminiSettings.from_env()
+    assert "secret-value" not in str(error.value)
+
+
+def test_request_timeout_has_an_independent_finite_default_and_override(monkeypatch):
+    assert gemini_request_timeout_seconds() == 60
+    assert GeminiSettings.from_env().request_timeout_seconds == 60
+    assert gemini_request_timeout_seconds(default=45) == 45
+    monkeypatch.setenv("SHIFTPATCH_AI_TIMEOUT_SECONDS", "120")
+    monkeypatch.setenv("SHIFTPATCH_GEMINI_REQUEST_TIMEOUT_SECONDS", "75.5")
+    assert GeminiSettings.from_env().request_timeout_seconds == 75.5
+    assert agent_timeout_seconds() == 120
+
+
+@pytest.mark.parametrize("value", ["5", "120"])
+def test_request_timeout_accepts_both_finite_boundaries(monkeypatch, value):
+    monkeypatch.setenv("SHIFTPATCH_GEMINI_REQUEST_TIMEOUT_SECONDS", value)
+    assert gemini_request_timeout_seconds() == float(value)

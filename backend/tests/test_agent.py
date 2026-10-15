@@ -339,8 +339,11 @@ def test_native_call_ids_are_preserved_in_observations_and_cached_replies(monkey
     (401, "model_authentication_failed", 1),
     (403, "model_permission_denied", 1),
     (404, "model_not_found", 1),
+    (408, "model_timeout", 2),
     (429, "model_rate_limited", 2),
-    (503, "model_unavailable", 2),
+    (500, "model_service_unavailable", 2),
+    (503, "model_service_unavailable", 2),
+    (504, "model_timeout", 2),
 ])
 def test_provider_errors_preserve_safe_diagnostics_without_credentials(monkeypatch, status, code, expected_calls):
     from types import SimpleNamespace
@@ -366,6 +369,80 @@ def test_provider_errors_preserve_safe_diagnostics_without_credentials(monkeypat
     assert proposal["recommended_candidate_id"] is None
     assert captured["calls"] == expected_calls
     assert "test-secret-do-not-leak" not in json.dumps(proposal)
+
+
+@pytest.mark.parametrize('timeout_seconds', [None, '75.5'])
+def test_sdk_request_timeout_reaches_both_transport_and_server_deadline(monkeypatch, timeout_seconds):
+    """Exercise SDK request construction with fake HTTP, without cloud access."""
+    import httpx
+    from google import genai
+    from app.agent.model_client import GeminiTransport
+
+    monkeypatch.setenv('SHIFTPATCH_GEMINI_PROVIDER', 'developer')
+    monkeypatch.setenv('SHIFTPATCH_GEMINI_MODEL', 'gemini-3.8-flash')
+    monkeypatch.setenv('GEMINI_API_KEY', 'test-secret')
+    monkeypatch.delenv('SHIFTPATCH_GEMINI_ENDPOINT', raising=False)
+    if timeout_seconds is None:
+        monkeypatch.delenv('SHIFTPATCH_GEMINI_REQUEST_TIMEOUT_SECONDS', raising=False)
+    else:
+        monkeypatch.setenv('SHIFTPATCH_GEMINI_REQUEST_TIMEOUT_SECONDS', timeout_seconds)
+    original_client = genai.Client
+    captured = {}
+
+    def respond(request):
+        captured['server_timeout'] = request.headers.get('x-server-timeout')
+        captured['transport_timeouts'] = request.extensions['timeout']
+        return httpx.Response(200, json={
+            'candidates': [{'content': {'role': 'model', 'parts': [{'text': '{"outcome":"needs_input"}'}]}}],
+        })
+
+    def create_client(*, enterprise=None, **kwargs):
+        kwargs['http_options'].httpx_async_client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+        return original_client(enterprise=enterprise, **kwargs)
+
+    monkeypatch.setattr(genai, 'Client', create_client)
+
+    async def check():
+        transport = GeminiTransport()
+        try:
+            reply = await transport.generate([{'role': 'user', 'parts': [{'text': 'Test'}]}],
+                                             'system', declarations('in_service'))
+            assert reply.final == {'outcome': 'needs_input'}
+        finally:
+            await transport.aclose()
+
+    asyncio.run(check())
+    seconds = float(timeout_seconds) if timeout_seconds is not None else 60
+    import math
+    assert captured['server_timeout'] == str(math.ceil(seconds))
+    assert captured['transport_timeouts']['read'] == seconds
+
+
+@pytest.mark.parametrize('backend', ['httpx', 'aiohttp'])
+def test_local_sdk_timeout_is_reported_and_retried_without_exposing_request_details(monkeypatch, backend):
+    from types import SimpleNamespace
+    import httpx
+    from app.agent.model_client import GeminiTransport
+
+    monkeypatch.setenv('SHIFTPATCH_AI_MODE', 'gemini')
+    captured = {'calls': 0}
+
+    class TimedOutModels:
+        async def generate_content(self, **kwargs):
+            captured['calls'] += 1
+            error = httpx.ReadTimeout if backend == 'httpx' else TimeoutError
+            raise error('private-request-url-and-token')
+
+    transport = GeminiTransport.__new__(GeminiTransport)
+    transport.model = 'configured-model'
+    transport.client = SimpleNamespace(aio=SimpleNamespace(models=TimedOutModels()))
+    proposal = generate(transport=transport)
+    assert proposal['status'] == 'failed'
+    assert proposal['error'] == 'model_timeout'
+    assert proposal['provider_http_status'] is None
+    assert proposal['recommended_candidate_id'] is None
+    assert captured['calls'] == 2
+    assert 'private-request-url-and-token' not in json.dumps(proposal)
 
 
 def test_missing_adc_reports_authentication_failure_without_raw_details(monkeypatch):

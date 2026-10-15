@@ -30,7 +30,7 @@ async def main():
         if settings.provider == "vertex":
             print(f"프로젝트: {settings.project} · 리전: {settings.location} · 인증: ADC")
         try:
-            async with asyncio.timeout(35):
+            async with asyncio.timeout(settings.request_timeout_seconds + 5):
                 response = await transport.client.aio.models.generate_content(
                     model=settings.model, contents="Reply with only OK.",
                     config=types.GenerateContentConfig(
