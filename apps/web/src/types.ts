@@ -163,6 +163,7 @@ export interface Proposal {
   elapsed_ms?: number;
   questions?: (AgentQuestion | string)[];
   error?: string;
+  provider_http_status?: number | null;
   snapshot?: Partial<Pick<Overview, "store" | "business_now" | "revision" | "staff" | "next_day_staff" | "inventory" | "history" | "closes">>;
 }
 

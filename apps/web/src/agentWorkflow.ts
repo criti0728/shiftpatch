@@ -2,6 +2,38 @@ import type { AgentQuestion, Ingredient, Overview, Proposal, ProposalMode, Scree
 
 type StoreState = Pick<Overview, "store" | "business_now" | "closes">;
 
+const analysisErrors: Record<string, string> = {
+  budget_exceeded: "分析の制限時間に達しました。最新の条件で再分析してください。",
+  interrupted: "分析を中断しました。必要なときに再分析できます。",
+  model_request_invalid: "Geminiへのリクエストが拒否されました。モデル・APIバージョン・接続先の設定を確認してから再分析してください。",
+  model_authentication_failed: "Gemini認証が無効です。サーバーのAPIキー、またはGCPの認証を更新してから再分析してください。",
+  model_permission_denied: "Geminiへのアクセスが拒否されました。認証アカウント・プロジェクトのVertex AI権限・APIの有効化・キーの制限を確認してから再分析してください。",
+  model_not_found: "指定したGeminiモデルまたは接続先が見つかりません。モデルID・リジョン・接続先の設定を確認してから再分析してください。",
+  model_rate_limited: "Geminiの利用制限に達しました。プロジェクトのクォータ・課金・クレジット残高を確認し、時間をおいて再分析してください。",
+  model_timeout: "Geminiの応答が制限時間内に返りませんでした。時間をおいて「最新の条件で再分析」を押してください。",
+  model_service_unavailable: "Geminiサービスで一時的な障害が発生しました。時間をおいて「最新の条件で再分析」を押してください。",
+  model_unavailable: "Geminiサービスに接続できません。接続先とサービスの状態を確認して再分析してください。",
+  agent_failed: "分析結果を検証できませんでした。店舗データを確認して再分析してください。",
+  calculation_failed: "計算に失敗しました。店舗データを確認して再計算してください。",
+};
+
+export function proposalErrorMessage(proposal: Pick<Proposal, "error" | "provider_http_status">) {
+  if (!proposal.error) return null;
+  const httpStatus = proposal.provider_http_status;
+  // Previously saved failures used model_unavailable even when the provider
+  // reported a precise HTTP error. Preserve that evidence in the explanation.
+  const statusCode = httpStatus === 400 ? "model_request_invalid"
+    : httpStatus === 401 ? "model_authentication_failed"
+    : httpStatus === 403 ? "model_permission_denied"
+    : httpStatus === 404 ? "model_not_found"
+    : httpStatus === 408 || httpStatus === 504 ? "model_timeout"
+    : httpStatus === 429 ? "model_rate_limited"
+    : httpStatus && httpStatus >= 500 ? "model_service_unavailable" : undefined;
+  const code = proposal.error.startsWith("model_") ? statusCode || proposal.error : proposal.error;
+  return analysisErrors[code]
+    || "分析を完了できませんでした。最新の条件で再分析してください。";
+}
+
 export function isClosed(data: StoreState) {
   return data.closes.some(close => close.service_date === data.store.service_date);
 }

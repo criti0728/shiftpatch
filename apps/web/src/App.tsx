@@ -40,7 +40,7 @@ import { ApiError, request } from "./api";
 import SessionGate from "./SessionGate";
 import { AgentProgress, AgentQuestions } from "./AgentPanel";
 import { taskNeedsReallocation } from "./inventoryWorkflow";
-import { analysisBlockReason, continuedProposal, entryAnalysisMode, pendingQuestionProposal, questionFactUpdated } from "./agentWorkflow";
+import { analysisBlockReason, continuedProposal, entryAnalysisMode, pendingQuestionProposal, proposalErrorMessage, questionFactUpdated } from "./agentWorkflow";
 import type {
   AuthenticatedSession,
   AgentQuestion,
@@ -2292,6 +2292,7 @@ function ProposalModal({
   const retryBlocked = analysisBlockReason(data, proposal.mode);
   const structuredQuestions = (proposal.questions || []).filter((q): q is AgentQuestion => typeof q !== "string");
   const continuation = continuedProposal(proposal, data.proposals);
+  const errorMessage = proposalErrorMessage(proposal);
   return (
     <Modal
       title={
@@ -2313,14 +2314,13 @@ function ProposalModal({
         <Badge>{statusLabel(proposal.status)}</Badge>
         <span>{time(proposal.created_at)} 作成</span>
       </div>
-      <p className="proposal-summary">{proposal.summary}</p>
+      {errorMessage ? <div className="alert warning" role="alert">{errorMessage}</div> : <p className="proposal-summary">{proposal.summary}</p>}
       {stale && (
         <div className="alert warning">
           <AlertTriangle size={16} />
           作成後にお店の状態が変わりました。最新の条件で再分析してください。
         </div>
       )}
-      {proposal.error && <div className="alert warning">{({ budget_exceeded: "分析の制限時間に達しました。最新の条件で再試行できます。", interrupted: "分析を中断しました。必要なときに再開できます。", model_unavailable: "Geminiへの接続を確認して再試行してください。", agent_failed: "分析結果を検証できませんでした。再試行するか、店舗データを確認してください。", calculation_failed: "店舗データを確認して再計算してください。" } as Record<string, string>)[proposal.error] || proposal.error}</div>}
       {proposal.questions?.filter((q): q is string => typeof q === 'string').map(question => <div className="alert" key={question}>{question}</div>)}
       {proposal.status === 'waiting_input' && structuredQuestions.length > 0 && !continuation && <AgentQuestions key={proposal.id} questions={structuredQuestions} answers={answers} onAnswersChange={onAnswersChange} factsUpdated={Object.fromEntries(structuredQuestions.map(question => [question.id, questionFactUpdated(data, proposal, question.field)]))} busy={busy || Boolean(retryBlocked)} onContinue={onContinue} onEdit={onEdit}/>}
       {continuation && proposal.status === "waiting_input" && <div className="alert"><span>この確認事項への回答から新しい分析が作成されています。</span><button className="text-button" onClick={() => onOpenProposal(continuation)}>分析結果を確認</button></div>}

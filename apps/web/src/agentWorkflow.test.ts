@@ -1,5 +1,5 @@
 import { expect, it } from "vitest";
-import { analysisBlockReason, continuedProposal, entryAnalysisMode, pendingQuestionProposal, questionFactUpdated } from "./agentWorkflow";
+import { analysisBlockReason, continuedProposal, entryAnalysisMode, pendingQuestionProposal, proposalErrorMessage, questionFactUpdated } from "./agentWorkflow";
 import type { Ingredient, Overview, Proposal, Staff } from "./types";
 
 function state(now = "2026-10-11T11:00:00+09:00", closed = false) {
@@ -81,4 +81,38 @@ it("uses the compatibility fallback only for historical proposals without a fact
   data.revision = proposal.revision;
   expect(questionFactUpdated(data, proposal, "inventory")).toBe(false);
   expect(questionFactUpdated(data, proposal, "objective")).toBe(true);
+});
+
+it("explains an already saved generic Gemini failure as a timeout when HTTP 504 was recorded", () => {
+  const message = proposalErrorMessage({ error: "model_unavailable", provider_http_status: 504 });
+  expect(message).toContain("Geminiの応答が制限時間内に返りませんでした");
+  expect(message).toContain("再分析");
+  expect(message).not.toContain("認証");
+  expect(message).not.toContain("model_unavailable");
+});
+
+it.each([
+  [400, "model_request_invalid", "リクエストが拒否"],
+  [401, "model_authentication_failed", "認証を更新"],
+  [403, "model_permission_denied", "Vertex AI権限"],
+  [404, "model_not_found", "モデルID"],
+  [408, "model_timeout", "制限時間内"],
+  [429, "model_rate_limited", "クォータ・課金・クレジット残高"],
+  [503, "model_service_unavailable", "一時的な障害"],
+  [504, "model_timeout", "制限時間内"],
+] as const)("shows an actionable provider diagnostic for HTTP %s and its explicit error code", (status, error, expected) => {
+  const legacy = proposalErrorMessage({ error: "model_unavailable", provider_http_status: status });
+  const current = proposalErrorMessage({ error, provider_http_status: null });
+  expect(legacy).toContain(expected);
+  expect(current).toBe(legacy);
+  expect(current).not.toContain(error);
+});
+
+it("keeps a user interruption message even if an earlier provider timeout was recorded", () => {
+  expect(proposalErrorMessage({ error: "interrupted", provider_http_status: 504 })).toContain("中断");
+});
+
+it("does not show raw unknown error codes or an error message for successful proposals", () => {
+  expect(proposalErrorMessage({ error: "internal_unknown_error" })).not.toContain("internal_unknown_error");
+  expect(proposalErrorMessage({})).toBeNull();
 });
