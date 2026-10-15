@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -13,11 +14,12 @@ from urllib.request import urlopen
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend"))
 from app.settings import GeminiSettings, agent_timeout_seconds, load_env
+from app.cli import configure_console
 
 
 def web_dependencies_ready():
     web = ROOT / "apps/web"
-    packages = json.loads((web / "package.json").read_text())
+    packages = json.loads((web / "package.json").read_text(encoding="utf-8"))
     required = list(packages["dependencies"]) + ["vite", "typescript"]
     return all((web / "node_modules" / name / "package.json").is_file() for name in required) and all(
         (web / "node_modules" / path).is_file()
@@ -36,10 +38,50 @@ def servers_ready():
         return False
 
 
+def find_node():
+    installed = shutil.which("node")
+    if installed:
+        return installed
+    # Also support the project-local runtime, without changing the user's PATH.
+    portable = sorted((ROOT / ".venv/node-runtime").glob("node-*/node.exe"))
+    return str(portable[-1]) if portable else None
+
+
+def check_ports(ports=(8000, 5173)):
+    for port in ports:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            try:
+                probe.bind(("127.0.0.1", port))
+            except OSError:
+                raise ValueError(f"포트 {port}를 이미 사용 중입니다. 기존 서버를 종료하거나 해당 서버에 접속해 주세요.") from None
+
+
+def stop_process(process):
+    if process.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            # Kill only this launcher-owned process tree, including Vite/esbuild.
+            subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        else:
+            os.killpg(process.pid, signal.SIGTERM)
+        process.wait(timeout=5)
+    except ProcessLookupError:
+        pass
+    except subprocess.TimeoutExpired:
+        if os.name == "nt":
+            process.kill()
+        else:
+            os.killpg(process.pid, signal.SIGKILL)
+        process.wait(timeout=5)
+
+
 def main():
+    configure_console()
     python = ROOT / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-    npm = shutil.which("npm")
-    if not python.exists() or not npm:
+    node = find_node()
+    if not python.exists() or not node:
         sys.exit("먼저 README의 설치 명령을 실행해 주세요. (.venv, npm, node_modules 필요)")
     if not web_dependencies_ready():
         sys.exit("프런트엔드 패키지 설치가 완료되지 않았습니다. npm ci --prefix apps/web 가 성공한 뒤 다시 실행해 주세요.")
@@ -49,9 +91,11 @@ def main():
         if settings.mode == "gemini":
             settings.require_credentials()
             agent_timeout_seconds()
+        check_ports()
     except ValueError as error:
         sys.exit(str(error))
     os.environ.setdefault("SHIFTPATCH_AI_MODE", settings.mode)
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
     processes = []
 
     def stop(signum, frame):
@@ -61,7 +105,8 @@ def main():
     try:
         for command in [
             [str(python), "-m", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8000"],
-            [npm, "--prefix", "apps/web", "run", "dev", "--", "--port", "5173", "--strictPort"],
+            [node, str(ROOT / "apps/web/node_modules/vite/bin/vite.js"),
+             str(ROOT / "apps/web"), "--host", "127.0.0.1", "--port", "5173", "--strictPort"],
         ]:
             processes.append(subprocess.Popen(command, cwd=ROOT, start_new_session=os.name != "nt"))
         deadline = time.monotonic() + 20
@@ -83,24 +128,8 @@ def main():
     except KeyboardInterrupt:
         return 0
     finally:
-        for process in processes:
-            if process.poll() is not None:
-                continue
-            try:
-                if os.name == "nt":
-                    process.terminate()
-                else:
-                    os.killpg(process.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-        for process in processes:
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                if os.name == "nt":
-                    process.kill()
-                else:
-                    os.killpg(process.pid, signal.SIGKILL)
+        for process in reversed(processes):
+            stop_process(process)
 
 
 if __name__ == "__main__":

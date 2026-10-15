@@ -14,7 +14,7 @@ def sync(entry):
     entry['reserved'] = sum(lot['reserved'] for lot in entry['lots'])
     live = [lot['expires_at'] for lot in entry['lots'] if lot['quantity'] > 0]
     if live:
-        entry['expires_at'] = min(live)
+        entry['expires_at'] = min(live, key=parse_time)
 
 
 def ensure(entry, at=None):
