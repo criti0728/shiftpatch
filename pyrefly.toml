@@ -1,0 +1,12 @@
+# Preserve the basic checks used before the workspace had an explicit config.
+preset = "basic"
+project-includes = ["backend", "scripts"]
+search-path = ["backend", "scripts"]
+
+# Resolve the project's interpreter on macOS/Linux and Windows, rather than
+# checking dependencies against whichever Conda Python launched the editor.
+python-interpreter-find-command = [
+  "python",
+  "-c",
+  "import os; from pathlib import Path; print(Path('.venv') / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python'))",
+]
